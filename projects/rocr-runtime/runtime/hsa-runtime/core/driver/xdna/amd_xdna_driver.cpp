@@ -56,6 +56,7 @@
 
 #include "core/inc/amd_memory_region.h"
 #include "core/inc/runtime.h"
+#include "core/inc/signal.h"
 #include "core/util/memory.h"
 #include "core/util/utils.h"
 #include "uapi/amdxdna_accel.h"
@@ -830,6 +831,14 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_amd_aie_ert_packet_t* first_pkt, uin
     auto* cmd_pkt_payload =
         reinterpret_cast<hsa_amd_aie_ert_start_kernel_data_t*>(pkt->payload_data);
     FlushOperands(pkt->count, cmd_pkt_payload);
+
+    // Fire completion signal for this packet
+    if (pkt->completion_signal.handle != 0) {
+      core::Signal* sig = core::Signal::Convert(pkt->completion_signal);
+      if (sig != nullptr) {
+        sig->SubRelease(1);
+      }
+    }
   }
 
   // Unmapping and closing the cmd BOs
