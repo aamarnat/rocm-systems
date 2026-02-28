@@ -160,9 +160,41 @@ uint64_t XdnaDriver::GetDevHeapByteSize() {
   return dev_heap_size;
 }
 
-hsa_status_t XdnaDriver::Init() { return InitDeviceHeap(); }
+hsa_status_t XdnaDriver::Init() {
+  hsa_status_t status = InitDeviceHeap();
+  if (status != HSA_STATUS_SUCCESS) {
+    return status;
+  }
 
-hsa_status_t XdnaDriver::ShutDown() { return FreeDeviceHeap(); }
+  // Start background worker thread
+  wait_thread_ = std::thread(&XdnaDriver::WaitThreadFunc, this);
+
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t XdnaDriver::ShutDown() {
+  // Signal worker thread to stop
+  {
+    std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+    shutdown_ = true;
+  }
+  pending_cmds_cv_.notify_one();
+
+  // Wait for worker thread to finish
+  if (wait_thread_.joinable()) {
+    wait_thread_.join();
+  }
+
+  // Destroy any remaining deferred contexts
+  for (uint32_t hw_ctx_handle : deferred_destroy_contexts_) {
+    amdxdna_drm_destroy_hwctx destroy_args = {};
+    destroy_args.handle = hw_ctx_handle;
+    ioctl(fd_, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &destroy_args);
+  }
+  deferred_destroy_contexts_.clear();
+
+  return FreeDeviceHeap();
+}
 
 hsa_status_t XdnaDriver::QueryKernelModeDriver(core::DriverQuery query) {
   switch (query) {
@@ -396,6 +428,9 @@ hsa_status_t XdnaDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
     return HSA_STATUS_ERROR_INVALID_QUEUE;
   }
 
+  // Wait for all pending commands on this queue to complete
+  const_cast<XdnaDriver*>(this)->WaitForQueueCompletion(queue_id);
+
   auto hw_ctx_handle = static_cast<uint32_t>(queue_id);
   amdxdna_drm_destroy_hwctx destroy_hwctx_args = {};
   destroy_hwctx_args.handle = hw_ctx_handle;
@@ -403,6 +438,8 @@ hsa_status_t XdnaDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
   if (ioctl(fd_, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &destroy_hwctx_args) < 0) {
     return HSA_STATUS_ERROR;
   }
+
+  const_cast<XdnaDriver*>(this)->active_hw_ctx_count_--;
 
   return HSA_STATUS_SUCCESS;
 }
@@ -576,15 +613,15 @@ hsa_status_t XdnaDriver::FreeDeviceHeap() {
   return status;
 }
 
-hsa_status_t XdnaDriver::ExecCmdAndWait(const BOHandle& cmd_chain_bo_handle,
-                                        const std::vector<uint32_t>& bo_handles,
-                                        HSA_QUEUEID queue_id) {
+hsa_status_t XdnaDriver::ExecCmd(const BOHandle& cmd_chain_bo_handle,
+                                 const std::vector<uint32_t>& bo_handles, HSA_QUEUEID queue_id,
+                                 uint64_t& seq) {
   if (queue_id == AMDXDNA_INVALID_CTX_HANDLE) {
     return HSA_STATUS_ERROR_INVALID_QUEUE;
   }
 
   auto hw_ctx_handle = static_cast<uint32_t>(queue_id);
-  // Submit command chain.
+  // Submit command chain without waiting.
   amdxdna_drm_exec_cmd exec_cmd = {};
   exec_cmd.hwctx = hw_ctx_handle;
   exec_cmd.type = AMDXDNA_CMD_SUBMIT_EXEC_BUF;
@@ -595,11 +632,26 @@ hsa_status_t XdnaDriver::ExecCmdAndWait(const BOHandle& cmd_chain_bo_handle,
 
   if (ioctl(fd_, DRM_IOCTL_AMDXDNA_EXEC_CMD, &exec_cmd) < 0) return HSA_STATUS_ERROR;
 
+  seq = exec_cmd.seq;
+  return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t XdnaDriver::ExecCmdAndWait(const BOHandle& cmd_chain_bo_handle,
+                                        const std::vector<uint32_t>& bo_handles,
+                                        HSA_QUEUEID queue_id) {
+  uint64_t seq;
+  hsa_status_t status = ExecCmd(cmd_chain_bo_handle, bo_handles, queue_id, seq);
+  if (status != HSA_STATUS_SUCCESS) {
+    return status;
+  }
+
+  auto hw_ctx_handle = static_cast<uint32_t>(queue_id);
   // Waiting for command chain to finish.
   amdxdna_drm_wait_cmd wait_cmd = {};
+  memset(&wait_cmd, 0, sizeof(wait_cmd));
   wait_cmd.hwctx = hw_ctx_handle;
   wait_cmd.timeout = DEFAULT_TIMEOUT_VAL;
-  wait_cmd.seq = exec_cmd.seq;
+  wait_cmd.seq = seq;
 
   if (ioctl(fd_, DRM_IOCTL_AMDXDNA_WAIT_CMD, &wait_cmd) < 0) return HSA_STATUS_ERROR;
 
@@ -820,48 +872,66 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_amd_aie_ert_packet_t* first_pkt, uin
   std::sort(bo_handles.begin(), bo_handles.end());
   bo_handles.erase(std::unique(bo_handles.begin(), bo_handles.end()), bo_handles.end());
 
-  // Executing all commands in the command chain
-  status = ExecCmdAndWait(cmd_chain_bo_handle, bo_handles, queue_id);
+  // Submit command asynchronously
+  uint64_t seq;
+  status = ExecCmd(cmd_chain_bo_handle, bo_handles, queue_id, seq);
   if (status != HSA_STATUS_SUCCESS) {
     return status;
   }
 
+  // Collect completion signals and operand info from all packets
+  std::vector<core::Signal*> completion_signals;
+  std::vector<OperandInfo> operands_to_flush;
+
   for (uint32_t pkt_iter = 0; pkt_iter < num_pkts; pkt_iter++) {
     hsa_amd_aie_ert_packet_t* pkt = first_pkt + pkt_iter;
-    auto* cmd_pkt_payload =
-        reinterpret_cast<hsa_amd_aie_ert_start_kernel_data_t*>(pkt->payload_data);
-    FlushOperands(pkt->count, cmd_pkt_payload);
 
-    // Fire completion signal for this packet
+    // Collect completion signal
     if (pkt->completion_signal.handle != 0) {
       core::Signal* sig = core::Signal::Convert(pkt->completion_signal);
       if (sig != nullptr) {
-        sig->SubRelease(1);
+        completion_signals.push_back(sig);
       }
     }
-  }
 
-  // Unmapping and closing the cmd BOs
-  cmd_bo_handles_guard.Dismiss();
-  for (auto& command_bo_handle : cmd_bo_handles) {
-    if (munmap(command_bo_handle.vaddr, command_bo_handle.size) != 0) {
-      status = HSA_STATUS_ERROR;
+    // Collect operand info for flushing after completion
+    auto* cmd_pkt_payload =
+        reinterpret_cast<hsa_amd_aie_ert_start_kernel_data_t*>(pkt->payload_data);
+    const uint32_t num_operands = GetOperandCount(pkt->count);
+    for (uint32_t operand_iter = 0; operand_iter < num_operands; operand_iter++) {
+      const uint32_t operand_index = operand_starting_index + 2 * operand_iter;
+      const uint64_t operand_addr = Concat<uint64_t>(cmd_pkt_payload->data[operand_index + 1],
+                                                     cmd_pkt_payload->data[operand_index]);
+      const uint32_t operand_size_starting_index = operand_starting_index + 2 * num_operands;
+      const uint32_t operand_bo_size =
+          cmd_pkt_payload->data[operand_size_starting_index + operand_iter];
+
+      operands_to_flush.push_back({reinterpret_cast<void*>(operand_addr), operand_bo_size});
     }
-    drm_gem_close close_bo_args = {};
-    close_bo_args.handle = command_bo_handle.handle;
-    ioctl(fd_, DRM_IOCTL_GEM_CLOSE, &close_bo_args);
   }
 
-  // Unmapping and closing the cmd_chain BO
+  // Queue command for async completion
+  PendingCommand pending_cmd;
+  pending_cmd.queue_id = queue_id;
+  pending_cmd.seq = seq;
+  pending_cmd.completion_signals = std::move(completion_signals);
+  pending_cmd.cmd_bo_handles = std::move(cmd_bo_handles);
+  pending_cmd.cmd_chain_bo_handle = cmd_chain_bo_handle;
+  pending_cmd.cmd_chain_size = cmd_chain_size;
+  pending_cmd.operands_to_flush = std::move(operands_to_flush);
+
+  {
+    std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+    pending_cmds_.push(std::move(pending_cmd));
+    pending_cmd_counts_[queue_id]++;
+  }
+  pending_cmds_cv_.notify_one();
+
+  // Don't destroy the BOs - the worker thread will handle that
+  cmd_bo_handles_guard.Dismiss();
   cmd_chain_bo_handle_guard.Dismiss();
-  if (munmap(cmd_chain, cmd_chain_size) != 0) {
-    status = HSA_STATUS_ERROR;
-  }
-  drm_gem_close close_bo_args = {};
-  close_bo_args.handle = cmd_chain_bo_handle.handle;
-  ioctl(fd_, DRM_IOCTL_GEM_CLOSE, &close_bo_args);
 
-  return status;
+  return HSA_STATUS_SUCCESS;
 }
 
 hsa_status_t XdnaDriver::SPMAcquire(uint32_t preferred_node_id) const {
@@ -937,6 +1007,7 @@ hsa_status_t XdnaDriver::ConfigHwCtx(const PDICache& pdi_bo_handles, HSA_QUEUEID
   }
   MAKE_SCOPE_GUARD([xdna_config_cu_param] { free(xdna_config_cu_param); });
 
+  memset(xdna_config_cu_param, 0, config_cu_param_size);
   xdna_config_cu_param->num_cus = pdi_bo_handles.size();
 
   for (size_t i = 0; i < pdi_bo_handles.size(); i++) {
@@ -947,18 +1018,13 @@ hsa_status_t XdnaDriver::ConfigHwCtx(const PDICache& pdi_bo_handles, HSA_QUEUEID
   auto hw_ctx_handle = static_cast<uint32_t>(queue_id);
 
   if (hw_ctx_handle != AMDXDNA_INVALID_CTX_HANDLE) {
-    // Destroy the hardware context
-    // Note: we can do this because we have forced synchronization between
-    // command chains. If we move to a more asynchronous model, we will need to
-    // figure out how hardware context destruction works while applications
-    // are running
-    amdxdna_drm_destroy_hwctx destroy_hwctx_args = {};
-    destroy_hwctx_args.handle = hw_ctx_handle;
-    if (ioctl(fd_, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &destroy_hwctx_args) < 0) {
-      return HSA_STATUS_ERROR;
-    }
+    // Defer hardware context destruction until pending commands complete
+    DeferContextDestruction(hw_ctx_handle);
     queue_id = AMDXDNA_INVALID_CTX_HANDLE;
   }
+
+  // Wait for an available hardware context slot before creating new one
+  WaitForAvailableHwCtxSlot();
 
   // Create the new hardware context
   // Currently we do not leverage QoS information.
@@ -984,6 +1050,7 @@ hsa_status_t XdnaDriver::ConfigHwCtx(const PDICache& pdi_bo_handles, HSA_QUEUEID
   }
 
   queue_id = create_hwctx_args.handle;
+  active_hw_ctx_count_++;
 
   return HSA_STATUS_SUCCESS;
 }
@@ -1038,6 +1105,109 @@ hsa_status_t XdnaDriver::MakeMemoryUnresident(const void* mem) const { return HS
 
 hsa_status_t XdnaDriver::GetShareableHandle(void* va, void* mem, size_t size, core::ShareableHandle* handle) {
   return HSA_STATUS_ERROR;
+}
+
+void XdnaDriver::WaitThreadFunc() {
+  while (true) {
+    PendingCommand cmd;
+    {
+      std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
+      pending_cmds_cv_.wait(lock, [this] { return shutdown_ || !pending_cmds_.empty(); });
+
+      if (shutdown_) {
+        return;
+      }
+
+      cmd = std::move(pending_cmds_.front());
+      pending_cmds_.pop();
+    }
+
+    auto hw_ctx_handle = static_cast<uint32_t>(cmd.queue_id);
+    // Wait for command to complete
+    amdxdna_drm_wait_cmd wait_cmd = {};
+    memset(&wait_cmd, 0, sizeof(wait_cmd));
+    wait_cmd.hwctx = hw_ctx_handle;
+    wait_cmd.timeout = DEFAULT_TIMEOUT_VAL;
+    wait_cmd.seq = cmd.seq;
+
+    hsa_status_t status = HSA_STATUS_SUCCESS;
+    if (ioctl(fd_, DRM_IOCTL_AMDXDNA_WAIT_CMD, &wait_cmd) < 0) {
+      status = HSA_STATUS_ERROR;
+    }
+
+    // Flush operands after completion
+    if (status == HSA_STATUS_SUCCESS) {
+      for (const auto& operand : cmd.operands_to_flush) {
+        FlushCpuCache(operand.addr, 0, operand.size);
+      }
+    }
+
+    // Fire completion signals
+    for (auto* sig : cmd.completion_signals) {
+      if (sig != nullptr) {
+        sig->SubRelease(1);
+      }
+    }
+
+    // Clean up BOs
+    for (auto& bo_handle : cmd.cmd_bo_handles) {
+      DestroyBOHandle(bo_handle);
+    }
+    DestroyBOHandle(cmd.cmd_chain_bo_handle);
+
+    // Decrement pending command count and check for deferred destructions
+    {
+      std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+      pending_cmd_counts_[cmd.queue_id]--;
+      if (pending_cmd_counts_[cmd.queue_id] == 0) {
+        pending_cmd_counts_.erase(cmd.queue_id);
+        queue_completion_cv_.notify_all();
+      }
+    }
+
+    DestroyCompletedDeferredContexts();
+  }
+}
+
+void XdnaDriver::DeferContextDestruction(uint32_t hw_ctx_handle) {
+  std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+  deferred_destroy_contexts_.insert(hw_ctx_handle);
+}
+
+void XdnaDriver::DestroyCompletedDeferredContexts() {
+  std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+  auto it = deferred_destroy_contexts_.begin();
+  while (it != deferred_destroy_contexts_.end()) {
+    uint32_t hw_ctx_handle = *it;
+    // Check if this context has any pending commands
+    if (pending_cmd_counts_.find(hw_ctx_handle) == pending_cmd_counts_.end()) {
+      // No pending commands, safe to destroy
+      amdxdna_drm_destroy_hwctx destroy_args = {};
+      destroy_args.handle = hw_ctx_handle;
+      ioctl(fd_, DRM_IOCTL_AMDXDNA_DESTROY_HWCTX, &destroy_args);
+      active_hw_ctx_count_--;
+      it = deferred_destroy_contexts_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void XdnaDriver::WaitForAvailableHwCtxSlot() {
+  std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
+  while (active_hw_ctx_count_ >= max_hw_ctx_count_) {
+    // Wait for a context to be destroyed
+    queue_completion_cv_.wait(lock);
+    // Try to destroy deferred contexts
+    DestroyCompletedDeferredContexts();
+  }
+}
+
+void XdnaDriver::WaitForQueueCompletion(HSA_QUEUEID queue_id) {
+  std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
+  queue_completion_cv_.wait(lock, [this, queue_id] {
+    return pending_cmd_counts_.find(queue_id) == pending_cmd_counts_.end();
+  });
 }
 
 } // namespace AMD

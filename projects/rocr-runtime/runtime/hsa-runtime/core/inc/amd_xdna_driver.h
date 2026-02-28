@@ -44,8 +44,13 @@
 
 #include <array>
 #include <climits>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
+#include <set>
+#include <thread>
 #include <unordered_map>
 
 #include "core/driver/xdna/uapi/amdxdna_accel.h"
@@ -289,13 +294,54 @@ public:
   hsa_status_t PrepareBOs(uint32_t count, hsa_amd_aie_ert_start_kernel_data_t* cmd_pkt_payload,
                           std::vector<uint32_t>& bo_handles);
 
-  /// @brief Executes a command and waits for its completion
+  /// @brief Executes a command and waits for its completion (DEPRECATED - use ExecCmd + async wait)
   ///
   /// @param cmd_chain_bo_handle command to execute
   /// @param bo_handles handles associated with the command
   /// @param aie_queue queue to submit to
   hsa_status_t ExecCmdAndWait(const BOHandle& cmd_chain_bo_handle,
                               const std::vector<uint32_t>& bo_handles, HSA_QUEUEID queue_id);
+
+  /// @brief Executes a command asynchronously without waiting
+  ///
+  /// @param cmd_chain_bo_handle command to execute
+  /// @param bo_handles handles associated with the command
+  /// @param queue_id queue to submit to
+  /// @param seq returned sequence number for this command
+  hsa_status_t ExecCmd(const BOHandle& cmd_chain_bo_handle, const std::vector<uint32_t>& bo_handles,
+                       HSA_QUEUEID queue_id, uint64_t& seq);
+
+  /// @brief Operand information for cache flushing after completion
+  struct OperandInfo {
+    void* addr;
+    size_t size;
+  };
+
+  /// @brief Information about a pending asynchronous command
+  struct PendingCommand {
+    HSA_QUEUEID queue_id;
+    uint64_t seq;
+    std::vector<core::Signal*> completion_signals;
+    std::vector<BOHandle> cmd_bo_handles;
+    BOHandle cmd_chain_bo_handle;
+    uint32_t cmd_chain_size;
+    std::vector<OperandInfo> operands_to_flush;
+  };
+
+  /// @brief Background worker thread function
+  void WaitThreadFunc();
+
+  /// @brief Defer hardware context destruction until pending commands complete
+  void DeferContextDestruction(uint32_t hw_ctx_handle);
+
+  /// @brief Destroy hardware contexts that have no pending commands
+  void DestroyCompletedDeferredContexts();
+
+  /// @brief Wait for an available hardware context slot
+  void WaitForAvailableHwCtxSlot();
+
+  /// @brief Wait for all pending commands on a queue to complete
+  void WaitForQueueCompletion(HSA_QUEUEID queue_id);
 
   /// TODO: Remove this in the future and rely on the core Runtime
   /// object to track handle allocations. Using the VMEM API for mapping XDNA
@@ -319,6 +365,24 @@ public:
 
   static constexpr size_t dev_heap_size = 64 * 1024 * 1024;
   static constexpr size_t dev_heap_align = 64 * 1024 * 1024;
+
+  // Async execution infrastructure
+  std::thread wait_thread_;
+  std::mutex pending_cmds_mutex_;
+  std::condition_variable pending_cmds_cv_;
+  std::queue<PendingCommand> pending_cmds_;
+  bool shutdown_ = false;
+
+  // Deferred context destruction
+  std::set<uint32_t> deferred_destroy_contexts_;
+  std::unordered_map<HSA_QUEUEID, uint32_t> pending_cmd_counts_;
+
+  // Hardware context limiting
+  static constexpr uint32_t max_hw_ctx_count_ = 4;
+  uint32_t active_hw_ctx_count_ = 0;
+
+  // Queue completion synchronization
+  std::condition_variable queue_completion_cv_;
 };
 
 } // namespace AMD
