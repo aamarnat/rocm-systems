@@ -74,6 +74,17 @@ static_assert((sizeof(core::ShareableHandle::handle) >= sizeof(uint32_t)) &&
                   (alignof(core::ShareableHandle::handle) >= alignof(uint32_t)),
               "ShareableHandle cannot store a XDNA handle");
 
+// DRM syncobj eventfd ioctl definition
+struct drm_syncobj_eventfd {
+  uint32_t handle;
+  uint32_t flags;
+  uint64_t point;
+  int32_t fd;
+  uint32_t pad;
+};
+
+#define DRM_IOCTL_SYNCOBJ_EVENTFD DRM_IOWR(0xCF, struct drm_syncobj_eventfd)
+
 //==============================================================================
 // EventFDPool Implementation
 //==============================================================================
@@ -573,6 +584,9 @@ hsa_status_t XdnaDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
 
   // Drop PDI cache.
   const_cast<std::unordered_map<HSA_QUEUEID, PDICache>&>(queue_pdi_map_).erase(queue_id);
+
+  // Erase syncobj handle for this queue
+  const_cast<std::unordered_map<HSA_QUEUEID, uint32_t>&>(queue_syncobj_handles_).erase(queue_id);
 
   // Destroy hardware context associated with the queue.
   amdxdna_drm_destroy_hwctx destroy_hwctx_args = {};
@@ -1100,7 +1114,38 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_amd_aie_ert_packet_t* first_pkt, uin
     }
   }
 
-  // Queue command for async completion
+  // Register eventfd for async completion notification
+  CommandKey key{queue_id, seq};
+
+  // Acquire an eventfd from the pool
+  int efd = eventfd_pool_.Acquire(key);
+  if (efd < 0) {
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+
+  // Get the syncobj handle for this queue
+  auto syncobj_it = queue_syncobj_handles_.find(queue_id);
+  if (syncobj_it == queue_syncobj_handles_.end()) {
+    eventfd_pool_.Release(efd);
+    return HSA_STATUS_ERROR_INVALID_QUEUE;
+  }
+  uint32_t syncobj_handle = syncobj_it->second;
+
+  // Register eventfd with DRM syncobj timeline
+  struct drm_syncobj_eventfd syncobj_eventfd_args = {
+    .handle = syncobj_handle,
+    .flags = 0,
+    .point = seq,  // Timeline point
+    .fd = efd,
+    .pad = 0,
+  };
+
+  if (ioctl(fd_, DRM_IOCTL_SYNCOBJ_EVENTFD, &syncobj_eventfd_args) < 0) {
+    eventfd_pool_.Release(efd);
+    return HSA_STATUS_ERROR;
+  }
+
+  // Store pending command
   PendingCommand pending_cmd;
   pending_cmd.queue_id = queue_id;
   pending_cmd.seq = seq;
@@ -1112,12 +1157,24 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_amd_aie_ert_packet_t* first_pkt, uin
 
   {
     std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
-    pending_cmds_.push(std::move(pending_cmd));
+    pending_callbacks_[key] = std::move(pending_cmd);
+    fd_to_key_[efd] = key;
     pending_cmd_counts_[queue_id]++;
   }
-  pending_cmds_cv_.notify_one();
 
-  // Don't destroy the BOs - the worker thread will handle that
+  // Add eventfd to epoll
+  struct epoll_event ev = {.events = EPOLLIN, .data = {.fd = efd}};
+  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, efd, &ev) < 0) {
+    // Cleanup on failure
+    std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+    pending_callbacks_.erase(key);
+    fd_to_key_.erase(efd);
+    pending_cmd_counts_[queue_id]--;
+    eventfd_pool_.Release(efd);
+    return HSA_STATUS_ERROR;
+  }
+
+  // Don't destroy the BOs - the epoll monitor thread will handle that
   cmd_bo_handles_guard.Dismiss();
   cmd_chain_bo_handle_guard.Dismiss();
 
@@ -1253,6 +1310,10 @@ hsa_status_t XdnaDriver::ConfigHwCtx(const PDICache& pdi_bo_handles, HSA_QUEUEID
   }
 
   queue_id = create_hwctx_args.handle;
+
+  // Store the syncobj handle for this queue (used for eventfd registration)
+  queue_syncobj_handles_[queue_id] = create_hwctx_args.syncobj_handle;
+
   active_hw_ctx_count_++;
 
   return HSA_STATUS_SUCCESS;
@@ -1404,6 +1465,115 @@ void XdnaDriver::WaitForAvailableHwCtxSlot() {
     queue_completion_cv_.wait(lock);
     // Try to destroy deferred contexts (lock already held)
     DestroyCompletedDeferredContextsUnlocked();
+  }
+}
+
+void XdnaDriver::FlushAndSignal(const PendingCommand& cmd) {
+  // Flush CPU caches for output operands
+  for (const auto& operand : cmd.operands_to_flush) {
+    if (operand.addr && operand.size > 0) {
+      FlushCpuCache(operand.addr, 0, operand.size);
+    }
+  }
+
+  // Fire completion signals
+  for (auto* sig : cmd.completion_signals) {
+    if (sig != nullptr) {
+      sig->SubRelease(1);
+    }
+  }
+
+  // Clean up buffer objects
+  for (const auto& bo_handle : cmd.cmd_bo_handles) {
+    // Need to const_cast since DestroyBOHandle takes non-const reference
+    DestroyBOHandle(const_cast<BOHandle&>(bo_handle));
+  }
+
+  // Clean up command chain BO
+  if (cmd.cmd_chain_bo_handle.IsValid()) {
+    DestroyBOHandle(const_cast<BOHandle&>(cmd.cmd_chain_bo_handle));
+  }
+}
+
+void XdnaDriver::EpollMonitorFunc() {
+  const int MAX_EVENTS = 32;
+  struct epoll_event events[MAX_EVENTS];
+
+  while (!shutdown_) {
+    int nfds = epoll_wait(epoll_fd_, events, MAX_EVENTS, 1000 /*1s timeout*/);
+
+    if (nfds < 0) {
+      if (errno == EINTR) continue;
+      break;  // Error
+    }
+
+    // Process all signaled eventfds
+    for (int i = 0; i < nfds; i++) {
+      int efd = events[i].data.fd;
+
+      // Check if this is the shutdown eventfd
+      if (shutdown_) {
+        break;
+      }
+
+      // Read the eventfd value
+      uint64_t val;
+      if (eventfd_read(efd, &val) < 0) {
+        continue;
+      }
+
+      // Find associated command
+      CommandKey key;
+      PendingCommand cmd;
+      bool found = false;
+
+      {
+        std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+
+        auto key_it = fd_to_key_.find(efd);
+        if (key_it == fd_to_key_.end()) {
+          continue;  // Not found, skip
+        }
+
+        key = key_it->second;
+        auto cmd_it = pending_callbacks_.find(key);
+        if (cmd_it == pending_callbacks_.end()) {
+          fd_to_key_.erase(key_it);
+          continue;  // Command not found
+        }
+
+        cmd = std::move(cmd_it->second);
+        pending_callbacks_.erase(cmd_it);
+        fd_to_key_.erase(key_it);
+        found = true;
+      }
+
+      if (!found) {
+        continue;
+      }
+
+      // Remove from epoll
+      epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, efd, nullptr);
+
+      // Return eventfd to pool
+      eventfd_pool_.Release(efd);
+
+      // Process completion (flush, signal, cleanup)
+      FlushAndSignal(cmd);
+
+      // Decrement pending count
+      {
+        std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+        pending_cmd_counts_[cmd.queue_id]--;
+        if (pending_cmd_counts_[cmd.queue_id] == 0) {
+          pending_cmd_counts_.erase(cmd.queue_id);
+          queue_completion_cv_.notify_all();
+        }
+      }
+
+      // Try to destroy completed deferred contexts
+      DestroyCompletedDeferredContexts();
+    }
   }
 }
 
