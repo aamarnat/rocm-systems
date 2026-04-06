@@ -45,7 +45,7 @@
 cmake_minimum_required ( VERSION 3.7 )
 
 # Find Clang package and LLVM package
-find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
+# find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 find_package(LLVM REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 
 # Set the target devices
@@ -56,10 +56,10 @@ set (POSTFIX "9;1010;10;11;12")
 
 # If verbose output is enabled, print paths and target devices
 if(${CMAKE_VERBOSE_MAKEFILE})
-	get_property(clang_path TARGET clang PROPERTY LOCATION)
-	get_property(objcopy_path TARGET llvm-objcopy PROPERTY LOCATION)
-	message("Using clang from: ${clang_path}")
-	message("Using llvm-objcopy from: ${objcopy_path}")
+# 	get_property(clang_path TARGET clang PROPERTY LOCATION)
+# 	get_property(objcopy_path TARGET llvm-objcopy PROPERTY LOCATION)
+# 	message("Using clang from: ${clang_path}")
+# 	message("Using llvm-objcopy from: ${objcopy_path}")
 	message("Blit Shaders assembled for: ${TARGET_DEVS}")
 endif()
 
@@ -71,8 +71,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 	separate_arguments(CLANG_ARG_LIST UNIX_COMMAND "-x assembler -target amdgcn-amd-amdhsa -mcode-object-version=5 -fPIC -mcpu=${TARGET_ID} -o ${CODE_OBJECT} ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE}")
 
 	# Add custom command to generate the kernel bitcode
-	add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND clang ${CLANG_ARG_LIST}
-	DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE} clang
+	add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND /opt/rocm/bin/amdclang ${CLANG_ARG_LIST}
+	DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE}
 	COMMENT "BUILDING bitcode for ${OUTPUT_FILE}..."
 	VERBATIM)
 
@@ -81,7 +81,7 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 	# Add custom command to extract binary from the bitcode
 	add_custom_command(OUTPUT ${OUTPUT_FILE}
 	COMMAND llvm-objcopy ${OBJCOPY_ARG_LIST}
-	DEPENDS ${CODE_OBJECT} llvm-objcopy
+	DEPENDS ${CODE_OBJECT}
 	COMMENT "Extracting binary for ${OUTPUT_FILE}..."
 	VERBATIM)
 

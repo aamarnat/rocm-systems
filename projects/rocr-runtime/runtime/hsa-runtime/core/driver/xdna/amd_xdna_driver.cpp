@@ -65,6 +65,9 @@
 namespace rocr {
 namespace AMD {
 
+// Default timeout for command wait (0 = no timeout)
+static constexpr uint32_t DEFAULT_TIMEOUT_VAL = 0;
+
 static_assert((sizeof(core::ShareableHandle::handle) >= sizeof(uint32_t)) &&
                   (alignof(core::ShareableHandle::handle) >= alignof(uint32_t)),
               "ShareableHandle cannot store a XDNA handle");
@@ -1212,10 +1215,6 @@ hsa_status_t XdnaDriver::GetQueueSaveAreaInfo(HSA_QUEUEID queue_id, void** addre
 }
 
 hsa_status_t XdnaDriver::MakeMemoryUnresident(const void* mem) const { return HSA_STATUS_ERROR; }
-
-hsa_status_t XdnaDriver::GetShareableHandle(void* va, void* mem, size_t size, core::ShareableHandle* handle) {
-  return HSA_STATUS_ERROR;
-}
 
 void XdnaDriver::WaitThreadFunc() {
   while (true) {

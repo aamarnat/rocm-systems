@@ -43,7 +43,7 @@
 cmake_minimum_required ( VERSION 3.7 )
 
 # Import target 'clang'
-find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
+# find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 
 # Determine the target devices if not specified
 if (NOT DEFINED TARGET_DEVICES)
@@ -55,12 +55,12 @@ endif()
 set( TARGET_DEVICES ${TARGET_DEVICES} CACHE STRING "Build targets" FORCE )
 
 if(${CMAKE_VERBOSE_MAKEFILE})
-  get_property(clang_path TARGET clang PROPERTY LOCATION)
-  message("Using clang from: ${clang_path}")
+#   get_property(clang_path TARGET clang PROPERTY LOCATION)
+#   message("Using clang from: ${clang_path}")
   message("Build Setting:")
   message("  Target Devices*: ${TARGET_DEVICES}")
   message("  (Specify \";\" separated list of target IDs.)")
-  message("       Clang path: ${clang_path}")
+#   message("       Clang path: ${clang_path}")
 endif()
 
 ##==========================================
@@ -77,8 +77,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 
   ## Add custom command to produce a code object file.
   ## This depends on the kernel source file & compiler.
-  add_custom_command(OUTPUT ${OUTPUT_FILE} COMMAND clang ${CLANG_ARG_LIST}
-    DEPENDS ${INPUT_FILE} clang
+  add_custom_command(OUTPUT ${OUTPUT_FILE} COMMAND /opt/rocm/bin/amdclang ${CLANG_ARG_LIST}
+    DEPENDS ${INPUT_FILE}
     COMMENT "BUILDING bitcode for ${OUTPUT_FILE}..."
     VERBATIM)
 
