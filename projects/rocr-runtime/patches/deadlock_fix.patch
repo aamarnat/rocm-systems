@@ -1,0 +1,25 @@
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/driver/xdna/amd_xdna_driver.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/driver/xdna/amd_xdna_driver.cpp
+index 782ffdaa03..c454fee841 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/driver/xdna/amd_xdna_driver.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/driver/xdna/amd_xdna_driver.cpp
+@@ -65,6 +65,9 @@
+ namespace rocr {
+ namespace AMD {
+ 
++// Default timeout for command wait (0 = no timeout)
++static constexpr uint32_t DEFAULT_TIMEOUT_VAL = 0;
++
+ static_assert((sizeof(core::ShareableHandle::handle) >= sizeof(uint32_t)) &&
+                   (alignof(core::ShareableHandle::handle) >= alignof(uint32_t)),
+               "ShareableHandle cannot store a XDNA handle");
+@@ -1213,10 +1216,6 @@ hsa_status_t XdnaDriver::GetQueueSaveAreaInfo(HSA_QUEUEID queue_id, void** addre
+ 
+ hsa_status_t XdnaDriver::MakeMemoryUnresident(const void* mem) const { return HSA_STATUS_ERROR; }
+ 
+-hsa_status_t XdnaDriver::GetShareableHandle(void* va, void* mem, size_t size, core::ShareableHandle* handle) {
+-  return HSA_STATUS_ERROR;
+-}
+-
+ void XdnaDriver::WaitThreadFunc() {
+   while (true) {
+     PendingCommand cmd;
