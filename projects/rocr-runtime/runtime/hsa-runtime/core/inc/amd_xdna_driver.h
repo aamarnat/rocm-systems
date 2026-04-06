@@ -317,6 +317,16 @@ public:
     size_t size;
   };
 
+  /// @brief Unique key for identifying a command across queue_id and sequence number
+  struct CommandKey {
+    HSA_QUEUEID queue_id;
+    uint64_t seq;
+
+    bool operator==(const CommandKey& other) const {
+      return queue_id == other.queue_id && seq == other.seq;
+    }
+  };
+
   /// @brief Information about a pending asynchronous command
   struct PendingCommand {
     HSA_QUEUEID queue_id;
@@ -337,11 +347,23 @@ public:
   /// @brief Destroy hardware contexts that have no pending commands
   void DestroyCompletedDeferredContexts();
 
+  /// @brief Destroy hardware contexts (unlocked version, assumes lock held)
+  void DestroyCompletedDeferredContextsUnlocked();
+
   /// @brief Wait for an available hardware context slot
   void WaitForAvailableHwCtxSlot();
 
   /// @brief Wait for all pending commands on a queue to complete
   void WaitForQueueCompletion(HSA_QUEUEID queue_id);
+
+  /// @brief Wait on multiple syncobj timeline points, return first signaled
+  /// @return 0 on success, -1 on error or timeout
+  int SyncObjTimelineWaitAny(const std::vector<std::pair<uint32_t, uint64_t>>& wait_points,
+                             uint32_t timeout_ms,
+                             uint32_t* first_signaled);
+
+  /// @brief Process completion for a pending command (flush caches, fire signals, cleanup)
+  void FlushAndSignal(const PendingCommand& cmd);
 
   /// TODO: Remove this in the future and rely on the core Runtime
   /// object to track handle allocations. Using the VMEM API for mapping XDNA
@@ -369,9 +391,12 @@ public:
   // Async execution infrastructure
   std::thread wait_thread_;
   std::mutex pending_cmds_mutex_;
-  std::condition_variable pending_cmds_cv_;
-  std::queue<PendingCommand> pending_cmds_;
+  std::condition_variable active_cmds_cv_;
+  std::unordered_map<CommandKey, PendingCommand> active_cmds_;
   bool shutdown_ = false;
+
+  // Syncobj handle tracking (queue_id -> syncobj_handle)
+  std::unordered_map<HSA_QUEUEID, uint32_t> queue_syncobj_handles_;
 
   // Deferred context destruction
   std::set<uint32_t> deferred_destroy_contexts_;
@@ -387,5 +412,15 @@ public:
 
 } // namespace AMD
 } // namespace rocr
+
+// Hash specialization for CommandKey to use in unordered_map
+namespace std {
+  template<>
+  struct hash<rocr::AMD::XdnaDriver::CommandKey> {
+    size_t operator()(const rocr::AMD::XdnaDriver::CommandKey& k) const {
+      return hash<uint64_t>()(k.queue_id) ^ (hash<uint64_t>()(k.seq) << 1);
+    }
+  };
+}
 
 #endif // header guard

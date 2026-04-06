@@ -42,6 +42,7 @@
 
 #include "core/inc/amd_xdna_driver.h"
 
+#include <drm/drm.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -440,6 +441,9 @@ hsa_status_t XdnaDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
   }
 
   const_cast<XdnaDriver*>(this)->active_hw_ctx_count_--;
+
+  // Erase syncobj handle for this queue
+  const_cast<XdnaDriver*>(this)->queue_syncobj_handles_.erase(queue_id);
 
   return HSA_STATUS_SUCCESS;
 }
@@ -922,10 +926,11 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_amd_aie_ert_packet_t* first_pkt, uin
 
   {
     std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
-    pending_cmds_.push(std::move(pending_cmd));
+    CommandKey key{queue_id, seq};
+    active_cmds_[key] = std::move(pending_cmd);
     pending_cmd_counts_[queue_id]++;
   }
-  pending_cmds_cv_.notify_one();
+  active_cmds_cv_.notify_one();
 
   // Don't destroy the BOs - the worker thread will handle that
   cmd_bo_handles_guard.Dismiss();
@@ -1052,6 +1057,9 @@ hsa_status_t XdnaDriver::ConfigHwCtx(const PDICache& pdi_bo_handles, HSA_QUEUEID
   queue_id = create_hwctx_args.handle;
   active_hw_ctx_count_++;
 
+  // Store the syncobj handle for this queue
+  queue_syncobj_handles_[queue_id] = create_hwctx_args.syncobj_handle;
+
   return HSA_STATUS_SUCCESS;
 }
 
@@ -1109,55 +1117,72 @@ hsa_status_t XdnaDriver::GetShareableHandle(void* va, void* mem, size_t size, co
 
 void XdnaDriver::WaitThreadFunc() {
   while (true) {
-    PendingCommand cmd;
+    std::vector<std::pair<uint32_t, uint64_t>> wait_points;
+    std::vector<CommandKey> key_map;
+
     {
       std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
-      pending_cmds_cv_.wait(lock, [this] { return shutdown_ || !pending_cmds_.empty(); });
+
+      // Wait for active commands
+      active_cmds_cv_.wait(lock, [this] {
+        return shutdown_ || !active_cmds_.empty();
+      });
 
       if (shutdown_) {
         return;
       }
 
-      cmd = std::move(pending_cmds_.front());
-      pending_cmds_.pop();
-    }
-
-    auto hw_ctx_handle = static_cast<uint32_t>(cmd.queue_id);
-    // Wait for command to complete
-    amdxdna_drm_wait_cmd wait_cmd = {};
-    memset(&wait_cmd, 0, sizeof(wait_cmd));
-    wait_cmd.hwctx = hw_ctx_handle;
-    wait_cmd.timeout = DEFAULT_TIMEOUT_VAL;
-    wait_cmd.seq = cmd.seq;
-
-    hsa_status_t status = HSA_STATUS_SUCCESS;
-    if (ioctl(fd_, DRM_IOCTL_AMDXDNA_WAIT_CMD, &wait_cmd) < 0) {
-      status = HSA_STATUS_ERROR;
-    }
-
-    // Flush operands after completion
-    if (status == HSA_STATUS_SUCCESS) {
-      for (const auto& operand : cmd.operands_to_flush) {
-        FlushCpuCache(operand.addr, 0, operand.size);
+      // Build wait array from active commands
+      for (const auto& [key, cmd] : active_cmds_) {
+        auto it = queue_syncobj_handles_.find(key.queue_id);
+        if (it == queue_syncobj_handles_.end()) {
+          // Queue was destroyed, skip this command
+          continue;
+        }
+        uint32_t syncobj_handle = it->second;
+        wait_points.emplace_back(syncobj_handle, key.seq);
+        key_map.push_back(key);
       }
     }
 
-    // Fire completion signals
-    for (auto* sig : cmd.completion_signals) {
-      if (sig != nullptr) {
-        sig->SubRelease(1);
-      }
+    if (wait_points.empty()) {
+      // All commands were from destroyed queues
+      continue;
     }
 
-    // Clean up BOs
-    for (auto& bo_handle : cmd.cmd_bo_handles) {
-      DestroyBOHandle(bo_handle);
-    }
-    DestroyBOHandle(cmd.cmd_chain_bo_handle);
+    // Wait for any command to complete (outside lock)
+    uint32_t first_signaled = 0;
+    int ret = SyncObjTimelineWaitAny(wait_points, DEFAULT_TIMEOUT_VAL, &first_signaled);
 
-    // Decrement pending command count and check for deferred destructions
+    if (ret < 0) {
+      // Timeout or error - retry
+      continue;
+    }
+
+    // Find and process completed command
     {
-      std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+      std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
+      CommandKey completed_key = key_map[first_signaled];
+      auto it = active_cmds_.find(completed_key);
+
+      if (it == active_cmds_.end()) {
+        // Already processed, continue
+        continue;
+      }
+
+      PendingCommand cmd = std::move(it->second);
+      active_cmds_.erase(it);
+
+      // Release lock before processing completion
+      lock.unlock();
+
+      // Process completion (flush, signal, cleanup)
+      FlushAndSignal(cmd);
+
+      // Reacquire lock for updating counts
+      lock.lock();
+
+      // Decrement pending count and cleanup
       pending_cmd_counts_[cmd.queue_id]--;
       if (pending_cmd_counts_[cmd.queue_id] == 0) {
         pending_cmd_counts_.erase(cmd.queue_id);
@@ -1169,6 +1194,67 @@ void XdnaDriver::WaitThreadFunc() {
   }
 }
 
+void XdnaDriver::FlushAndSignal(const PendingCommand& cmd) {
+  // Flush CPU caches for output operands
+  for (const auto& operand : cmd.operands_to_flush) {
+    if (operand.addr && operand.size > 0) {
+      FlushCpuCache(operand.addr, 0, operand.size);
+    }
+  }
+
+  // Fire completion signals
+  for (auto* sig : cmd.completion_signals) {
+    if (sig != nullptr) {
+      sig->SubRelease(1);
+    }
+  }
+
+  // Clean up buffer objects
+  for (auto& bo_handle : cmd.cmd_bo_handles) {
+    const_cast<XdnaDriver*>(this)->DestroyBOHandle(const_cast<BOHandle&>(bo_handle));
+  }
+
+  // Clean up command chain BO
+  if (cmd.cmd_chain_bo_handle.IsValid()) {
+    const_cast<XdnaDriver*>(this)->DestroyBOHandle(const_cast<BOHandle&>(cmd.cmd_chain_bo_handle));
+  }
+}
+
+int XdnaDriver::SyncObjTimelineWaitAny(
+    const std::vector<std::pair<uint32_t, uint64_t>>& wait_points,
+    uint32_t timeout_ms,
+    uint32_t* first_signaled) {
+
+  if (wait_points.empty()) {
+    return -1;
+  }
+
+  std::vector<uint32_t> handles;
+  std::vector<uint64_t> points;
+
+  for (const auto& [handle, point] : wait_points) {
+    handles.push_back(handle);
+    points.push_back(point);
+  }
+
+  struct drm_syncobj_timeline_wait args = {};
+  args.handles = reinterpret_cast<uint64_t>(handles.data());
+  args.points = reinterpret_cast<uint64_t>(points.data());
+  args.timeout_nsec = static_cast<int64_t>(timeout_ms) * 1000000LL;
+  args.count_handles = static_cast<uint32_t>(handles.size());
+  args.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;  // Wait-any mode (default)
+  args.first_signaled = 0;
+  args.deadline_nsec = 0;
+
+  int ret = ioctl(fd_, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &args);
+
+  if (ret == 0 && first_signaled) {
+    *first_signaled = args.first_signaled;
+  }
+
+  return ret;
+}
+
 void XdnaDriver::DeferContextDestruction(uint32_t hw_ctx_handle) {
   std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
   deferred_destroy_contexts_.insert(hw_ctx_handle);
@@ -1176,6 +1262,11 @@ void XdnaDriver::DeferContextDestruction(uint32_t hw_ctx_handle) {
 
 void XdnaDriver::DestroyCompletedDeferredContexts() {
   std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+  DestroyCompletedDeferredContextsUnlocked();
+}
+
+void XdnaDriver::DestroyCompletedDeferredContextsUnlocked() {
+  // Assumes pending_cmds_mutex_ is already held
   auto it = deferred_destroy_contexts_.begin();
   while (it != deferred_destroy_contexts_.end()) {
     uint32_t hw_ctx_handle = *it;
@@ -1198,8 +1289,8 @@ void XdnaDriver::WaitForAvailableHwCtxSlot() {
   while (active_hw_ctx_count_ >= max_hw_ctx_count_) {
     // Wait for a context to be destroyed
     queue_completion_cv_.wait(lock);
-    // Try to destroy deferred contexts
-    DestroyCompletedDeferredContexts();
+    // Try to destroy deferred contexts (using unlocked version since we hold the lock)
+    DestroyCompletedDeferredContextsUnlocked();
   }
 }
 
