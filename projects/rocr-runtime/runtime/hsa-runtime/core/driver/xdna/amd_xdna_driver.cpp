@@ -471,7 +471,7 @@ XdnaDriver::AllocateMemory(const core::MemoryRegion &mem_region,
   create_bo_args.size = size;
   const bool use_bo_shmem = !m_region.IsDeviceSVM();
   if (use_bo_shmem) {
-    create_bo_args.type = AMDXDNA_BO_SHMEM;
+    create_bo_args.type = AMDXDNA_BO_SHARE;
   } else {
     // While this is already checked in MemoryRegion::AllocateImpl, the max size is
     // MemoryRegion::max_sysmem_alloc_size_ for HSA_HEAPTYPE_DEVICE_SVM which is incorrect
@@ -1366,68 +1366,6 @@ hsa_status_t XdnaDriver::GetQueueSaveAreaInfo(HSA_QUEUEID queue_id, void** addre
 }
 
 hsa_status_t XdnaDriver::MakeMemoryUnresident(const void* mem) const { return HSA_STATUS_ERROR; }
-
-void XdnaDriver::WaitThreadFunc() {
-  while (true) {
-    PendingCommand cmd;
-    {
-      std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
-      pending_cmds_cv_.wait(lock, [this] { return shutdown_ || !pending_cmds_.empty(); });
-
-      if (shutdown_) {
-        return;
-      }
-
-      cmd = std::move(pending_cmds_.front());
-      pending_cmds_.pop();
-    }
-
-    auto hw_ctx_handle = static_cast<uint32_t>(cmd.queue_id);
-    // Wait for command to complete
-    amdxdna_drm_wait_cmd wait_cmd = {};
-    memset(&wait_cmd, 0, sizeof(wait_cmd));
-    wait_cmd.hwctx = hw_ctx_handle;
-    wait_cmd.timeout = DEFAULT_TIMEOUT_VAL;
-    wait_cmd.seq = cmd.seq;
-
-    hsa_status_t status = HSA_STATUS_SUCCESS;
-    if (ioctl(fd_, DRM_IOCTL_AMDXDNA_WAIT_CMD, &wait_cmd) < 0) {
-      status = HSA_STATUS_ERROR;
-    }
-
-    // Flush operands after completion
-    if (status == HSA_STATUS_SUCCESS) {
-      for (const auto& operand : cmd.operands_to_flush) {
-        FlushCpuCache(operand.addr, 0, operand.size);
-      }
-    }
-
-    // Fire completion signals
-    for (auto* sig : cmd.completion_signals) {
-      if (sig != nullptr) {
-        sig->SubRelease(1);
-      }
-    }
-
-    // Clean up BOs
-    for (auto& bo_handle : cmd.cmd_bo_handles) {
-      DestroyBOHandle(bo_handle);
-    }
-    DestroyBOHandle(cmd.cmd_chain_bo_handle);
-
-    // Decrement pending command count and check for deferred destructions
-    {
-      std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
-      pending_cmd_counts_[cmd.queue_id]--;
-      if (pending_cmd_counts_[cmd.queue_id] == 0) {
-        pending_cmd_counts_.erase(cmd.queue_id);
-        queue_completion_cv_.notify_all();
-      }
-    }
-
-    DestroyCompletedDeferredContexts();
-  }
-}
 
 void XdnaDriver::DeferContextDestruction(uint32_t hw_ctx_handle) {
   std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
