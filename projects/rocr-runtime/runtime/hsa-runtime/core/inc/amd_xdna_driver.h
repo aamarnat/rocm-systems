@@ -329,8 +329,11 @@ public:
   /// @brief Defer hardware context destruction until pending commands complete
   void DeferContextDestruction(uint32_t hw_ctx_handle);
 
-  /// @brief Destroy hardware contexts that have no pending commands
+  /// @brief Destroy hardware contexts that have no pending commands (acquires lock)
   void DestroyCompletedDeferredContexts();
+
+  /// @brief Destroy hardware contexts that have no pending commands (assumes lock held)
+  void DestroyCompletedDeferredContextsUnlocked();
 
   /// @brief Wait for an available hardware context slot
   void WaitForAvailableHwCtxSlot();

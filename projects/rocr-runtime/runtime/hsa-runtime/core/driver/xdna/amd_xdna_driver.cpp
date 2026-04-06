@@ -1284,8 +1284,8 @@ void XdnaDriver::DeferContextDestruction(uint32_t hw_ctx_handle) {
   deferred_destroy_contexts_.insert(hw_ctx_handle);
 }
 
-void XdnaDriver::DestroyCompletedDeferredContexts() {
-  std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+void XdnaDriver::DestroyCompletedDeferredContextsUnlocked() {
+  // Assumes lock is already held by caller
   auto it = deferred_destroy_contexts_.begin();
   while (it != deferred_destroy_contexts_.end()) {
     uint32_t hw_ctx_handle = *it;
@@ -1303,13 +1303,18 @@ void XdnaDriver::DestroyCompletedDeferredContexts() {
   }
 }
 
+void XdnaDriver::DestroyCompletedDeferredContexts() {
+  std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+  DestroyCompletedDeferredContextsUnlocked();
+}
+
 void XdnaDriver::WaitForAvailableHwCtxSlot() {
   std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
   while (active_hw_ctx_count_ >= max_hw_ctx_count_) {
     // Wait for a context to be destroyed
     queue_completion_cv_.wait(lock);
-    // Try to destroy deferred contexts
-    DestroyCompletedDeferredContexts();
+    // Try to destroy deferred contexts (lock already held)
+    DestroyCompletedDeferredContextsUnlocked();
   }
 }
 
