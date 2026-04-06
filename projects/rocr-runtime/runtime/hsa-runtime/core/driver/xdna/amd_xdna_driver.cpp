@@ -43,6 +43,8 @@
 #include "core/inc/amd_xdna_driver.h"
 
 #include <fcntl.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -71,6 +73,76 @@ static constexpr uint32_t DEFAULT_TIMEOUT_VAL = 0;
 static_assert((sizeof(core::ShareableHandle::handle) >= sizeof(uint32_t)) &&
                   (alignof(core::ShareableHandle::handle) >= alignof(uint32_t)),
               "ShareableHandle cannot store a XDNA handle");
+
+//==============================================================================
+// EventFDPool Implementation
+//==============================================================================
+
+XdnaDriver::EventFDPool::EventFDPool(size_t pool_size) {
+  pool_.reserve(pool_size);
+  for (size_t i = 0; i < pool_size; i++) {
+    int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (fd < 0) {
+      // Failed to create eventfd, stop here
+      break;
+    }
+    pool_.push_back({fd, {0, 0}, false});
+  }
+}
+
+XdnaDriver::EventFDPool::~EventFDPool() {
+  for (auto& info : pool_) {
+    if (info.fd >= 0) {
+      close(info.fd);
+    }
+  }
+}
+
+int XdnaDriver::EventFDPool::Acquire(const CommandKey& key) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+
+  // Find an unused eventfd
+  for (auto& info : pool_) {
+    if (!info.in_use) {
+      info.in_use = true;
+      info.cmd_key = key;
+      return info.fd;
+    }
+  }
+
+  // Pool exhausted, create a new one
+  int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (fd < 0) {
+    return -1;
+  }
+  pool_.push_back({fd, key, true});
+  return fd;
+}
+
+void XdnaDriver::EventFDPool::Release(int fd) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+
+  for (auto& info : pool_) {
+    if (info.fd == fd) {
+      info.in_use = false;
+      // Reset the eventfd by reading it
+      uint64_t val;
+      eventfd_read(fd, &val);
+      return;
+    }
+  }
+}
+
+XdnaDriver::CommandKey XdnaDriver::EventFDPool::GetCommandKey(int fd) {
+  std::lock_guard<std::mutex> lock(pool_mutex_);
+
+  for (const auto& info : pool_) {
+    if (info.fd == fd) {
+      return info.cmd_key;
+    }
+  }
+  return {0, 0};  // Not found
+}
 
 /// @brief XDNA device type.
 enum class XDNADeviceType {
@@ -188,23 +260,41 @@ hsa_status_t XdnaDriver::Init() {
     return status;
   }
 
-  // Start background worker thread
-  wait_thread_ = std::thread(&XdnaDriver::WaitThreadFunc, this);
+  // Create epoll instance
+  epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+  if (epoll_fd_ < 0) {
+    return HSA_STATUS_ERROR;
+  }
+
+  // Start epoll monitor thread
+  epoll_monitor_thread_ = std::thread(&XdnaDriver::EpollMonitorFunc, this);
 
   return HSA_STATUS_SUCCESS;
 }
 
 hsa_status_t XdnaDriver::ShutDown() {
-  // Signal worker thread to stop
-  {
-    std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
-    shutdown_ = true;
-  }
-  pending_cmds_cv_.notify_one();
+  // Signal epoll monitor thread to stop
+  shutdown_ = true;
 
-  // Wait for worker thread to finish
-  if (wait_thread_.joinable()) {
-    wait_thread_.join();
+  // Wake epoll by creating and adding a shutdown eventfd
+  int shutdown_fd = eventfd(1, EFD_CLOEXEC);  // Create with value 1
+  if (shutdown_fd >= 0) {
+    struct epoll_event ev = {.events = EPOLLIN, .data = {.fd = shutdown_fd}};
+    epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, shutdown_fd, &ev);
+  }
+
+  // Wait for epoll monitor thread to finish
+  if (epoll_monitor_thread_.joinable()) {
+    epoll_monitor_thread_.join();
+  }
+
+  // Cleanup
+  if (shutdown_fd >= 0) {
+    close(shutdown_fd);
+  }
+  if (epoll_fd_ >= 0) {
+    close(epoll_fd_);
+    epoll_fd_ = -1;
   }
 
   // Destroy any remaining deferred contexts

@@ -312,6 +312,24 @@ public:
     size_t size;
   };
 
+  /// @brief Key for identifying a command (queue + sequence number)
+  struct CommandKey {
+    HSA_QUEUEID queue_id;
+    uint64_t seq;
+
+    bool operator==(const CommandKey& other) const {
+      return queue_id == other.queue_id && seq == other.seq;
+    }
+  };
+
+  /// @brief Hash function for CommandKey
+  struct CommandKeyHash {
+    std::size_t operator()(const CommandKey& key) const {
+      return std::hash<HSA_QUEUEID>()(key.queue_id) ^
+             (std::hash<uint64_t>()(key.seq) << 1);
+    }
+  };
+
   /// @brief Information about a pending asynchronous command
   struct PendingCommand {
     HSA_QUEUEID queue_id;
@@ -323,8 +341,32 @@ public:
     std::vector<OperandInfo> operands_to_flush;
   };
 
-  /// @brief Background worker thread function
-  void WaitThreadFunc();
+  /// @brief EventFD pool management
+  struct EventFDInfo {
+    int fd;
+    CommandKey cmd_key;
+    bool in_use;
+  };
+
+  class EventFDPool {
+   public:
+    explicit EventFDPool(size_t pool_size = 16);
+    ~EventFDPool();
+
+    int Acquire(const CommandKey& key);   // Get eventfd, returns fd
+    void Release(int fd);                 // Return eventfd to pool
+    CommandKey GetCommandKey(int fd);     // Lookup command by fd
+
+   private:
+    std::vector<EventFDInfo> pool_;
+    std::mutex pool_mutex_;
+  };
+
+  /// @brief Epoll monitor thread function
+  void EpollMonitorFunc();
+
+  /// @brief Process command completion (flush operands, fire signals, cleanup BOs)
+  void FlushAndSignal(const PendingCommand& cmd);
 
   /// @brief Defer hardware context destruction until pending commands complete
   void DeferContextDestruction(uint32_t hw_ctx_handle);
@@ -364,12 +406,17 @@ public:
   static constexpr size_t dev_heap_size = 64 * 1024 * 1024;
   static constexpr size_t dev_heap_align = 64 * 1024 * 1024;
 
-  // Async execution infrastructure
-  std::thread wait_thread_;
+  // Async execution infrastructure (EventFD + Epoll)
+  EventFDPool eventfd_pool_;
+  int epoll_fd_ = -1;
+  std::thread epoll_monitor_thread_;
+  std::unordered_map<int, CommandKey> fd_to_key_;
+  std::unordered_map<CommandKey, PendingCommand, CommandKeyHash> pending_callbacks_;
   std::mutex pending_cmds_mutex_;
-  std::condition_variable pending_cmds_cv_;
-  std::queue<PendingCommand> pending_cmds_;
   bool shutdown_ = false;
+
+  // Syncobj handle tracking (for eventfd registration)
+  std::unordered_map<HSA_QUEUEID, uint32_t> queue_syncobj_handles_;
 
   // Deferred context destruction
   std::set<uint32_t> deferred_destroy_contexts_;
