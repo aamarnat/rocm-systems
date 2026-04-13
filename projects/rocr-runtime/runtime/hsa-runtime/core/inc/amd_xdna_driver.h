@@ -327,6 +327,14 @@ public:
     }
   };
 
+  /// @brief Hash functor for CommandKey
+  struct CommandKeyHash {
+    std::size_t operator()(const CommandKey& key) const {
+      return std::hash<HSA_QUEUEID>()(key.queue_id) ^
+             (std::hash<uint64_t>()(key.seq) << 1);
+    }
+  };
+
   /// @brief Information about a pending asynchronous command
   struct PendingCommand {
     HSA_QUEUEID queue_id;
@@ -363,7 +371,7 @@ public:
                              uint32_t* first_signaled);
 
   /// @brief Process completion for a pending command (flush caches, fire signals, cleanup)
-  void FlushAndSignal(const PendingCommand& cmd);
+  void FlushAndSignal(PendingCommand& cmd);
 
   /// TODO: Remove this in the future and rely on the core Runtime
   /// object to track handle allocations. Using the VMEM API for mapping XDNA
@@ -392,7 +400,7 @@ public:
   std::thread wait_thread_;
   std::mutex pending_cmds_mutex_;
   std::condition_variable active_cmds_cv_;
-  std::unordered_map<CommandKey, PendingCommand> active_cmds_;
+  std::unordered_map<CommandKey, PendingCommand, CommandKeyHash> active_cmds_;
   bool shutdown_ = false;
 
   // Syncobj handle tracking (queue_id -> syncobj_handle)
@@ -412,15 +420,5 @@ public:
 
 } // namespace AMD
 } // namespace rocr
-
-// Hash specialization for CommandKey to use in unordered_map
-namespace std {
-  template<>
-  struct hash<rocr::AMD::XdnaDriver::CommandKey> {
-    size_t operator()(const rocr::AMD::XdnaDriver::CommandKey& k) const {
-      return hash<uint64_t>()(k.queue_id) ^ (hash<uint64_t>()(k.seq) << 1);
-    }
-  };
-}
 
 #endif // header guard

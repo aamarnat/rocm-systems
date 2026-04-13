@@ -179,7 +179,7 @@ hsa_status_t XdnaDriver::ShutDown() {
     std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
     shutdown_ = true;
   }
-  pending_cmds_cv_.notify_one();
+  active_cmds_cv_.notify_one();
 
   // Wait for worker thread to finish
   if (wait_thread_.joinable()) {
@@ -442,8 +442,11 @@ hsa_status_t XdnaDriver::DestroyQueue(HSA_QUEUEID queue_id) const {
 
   const_cast<XdnaDriver*>(this)->active_hw_ctx_count_--;
 
-  // Erase syncobj handle for this queue
-  const_cast<XdnaDriver*>(this)->queue_syncobj_handles_.erase(queue_id);
+  // Erase syncobj handle for this queue (requires lock for thread-safety)
+  {
+    std::lock_guard<std::mutex> lock(const_cast<XdnaDriver*>(this)->pending_cmds_mutex_);
+    const_cast<XdnaDriver*>(this)->queue_syncobj_handles_.erase(queue_id);
+  }
 
   return HSA_STATUS_SUCCESS;
 }
@@ -1057,8 +1060,11 @@ hsa_status_t XdnaDriver::ConfigHwCtx(const PDICache& pdi_bo_handles, HSA_QUEUEID
   queue_id = create_hwctx_args.handle;
   active_hw_ctx_count_++;
 
-  // Store the syncobj handle for this queue
-  queue_syncobj_handles_[queue_id] = create_hwctx_args.syncobj_handle;
+  // Store the syncobj handle for this queue (requires lock for thread-safety)
+  {
+    std::lock_guard<std::mutex> lock(pending_cmds_mutex_);
+    queue_syncobj_handles_[queue_id] = create_hwctx_args.syncobj_handle;
+  }
 
   return HSA_STATUS_SUCCESS;
 }
@@ -1146,7 +1152,15 @@ void XdnaDriver::WaitThreadFunc() {
     }
 
     if (wait_points.empty()) {
-      // All commands were from destroyed queues
+      // All commands were from destroyed queues, clean them up
+      std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
+      for (auto it = active_cmds_.begin(); it != active_cmds_.end(); ) {
+        if (queue_syncobj_handles_.find(it->first.queue_id) == queue_syncobj_handles_.end()) {
+          it = active_cmds_.erase(it);
+        } else {
+          ++it;
+        }
+      }
       continue;
     }
 
@@ -1159,42 +1173,51 @@ void XdnaDriver::WaitThreadFunc() {
       continue;
     }
 
+    // Validate index is in bounds (safety check for race conditions)
+    if (first_signaled >= key_map.size()) {
+      // Should never happen, but protect against crashes
+      continue;
+    }
+
     // Find and process completed command
     {
       std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
+
       CommandKey completed_key = key_map[first_signaled];
       auto it = active_cmds_.find(completed_key);
 
       if (it == active_cmds_.end()) {
-        // Already processed, continue
+        // Command already processed by another iteration, skip
         continue;
       }
 
+      // Extract command data before erasing
+      HSA_QUEUEID queue_id = it->first.queue_id;
       PendingCommand cmd = std::move(it->second);
       active_cmds_.erase(it);
 
-      // Release lock before processing completion
+      // Decrement pending count
+      auto count_it = pending_cmd_counts_.find(queue_id);
+      if (count_it != pending_cmd_counts_.end() && count_it->second > 0) {
+        count_it->second--;
+        if (count_it->second == 0) {
+          pending_cmd_counts_.erase(count_it);
+          queue_completion_cv_.notify_all();
+        }
+      }
+
+      // Release lock before expensive operations
       lock.unlock();
 
-      // Process completion (flush, signal, cleanup)
+      // Process completion (flush, signal, cleanup) - outside lock
       FlushAndSignal(cmd);
-
-      // Reacquire lock for updating counts
-      lock.lock();
-
-      // Decrement pending count and cleanup
-      pending_cmd_counts_[cmd.queue_id]--;
-      if (pending_cmd_counts_[cmd.queue_id] == 0) {
-        pending_cmd_counts_.erase(cmd.queue_id);
-        queue_completion_cv_.notify_all();
-      }
     }
 
     DestroyCompletedDeferredContexts();
   }
 }
 
-void XdnaDriver::FlushAndSignal(const PendingCommand& cmd) {
+void XdnaDriver::FlushAndSignal(PendingCommand& cmd) {
   // Flush CPU caches for output operands
   for (const auto& operand : cmd.operands_to_flush) {
     if (operand.addr && operand.size > 0) {
@@ -1211,12 +1234,12 @@ void XdnaDriver::FlushAndSignal(const PendingCommand& cmd) {
 
   // Clean up buffer objects
   for (auto& bo_handle : cmd.cmd_bo_handles) {
-    const_cast<XdnaDriver*>(this)->DestroyBOHandle(const_cast<BOHandle&>(bo_handle));
+    DestroyBOHandle(bo_handle);
   }
 
   // Clean up command chain BO
   if (cmd.cmd_chain_bo_handle.IsValid()) {
-    const_cast<XdnaDriver*>(this)->DestroyBOHandle(const_cast<BOHandle&>(cmd.cmd_chain_bo_handle));
+    DestroyBOHandle(cmd.cmd_chain_bo_handle);
   }
 }
 
