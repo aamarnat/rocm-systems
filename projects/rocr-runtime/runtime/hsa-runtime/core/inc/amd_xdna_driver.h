@@ -364,6 +364,11 @@ public:
   /// @brief Wait for all pending commands on a queue to complete
   void WaitForQueueCompletion(HSA_QUEUEID queue_id);
 
+  /// @brief Query current timeline values for multiple syncobjs
+  /// @return true on success, false on error
+  bool QuerySyncobjTimelineValues(const std::vector<std::pair<uint32_t, uint64_t>>& wait_points,
+                                  std::vector<uint64_t>& current_values);
+
   /// @brief Wait on multiple syncobj timeline points, return first signaled
   /// @return 0 on success, -1 on error or timeout
   int SyncObjTimelineWaitAny(const std::vector<std::pair<uint32_t, uint64_t>>& wait_points,

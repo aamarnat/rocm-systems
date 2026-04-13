@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: hsa-rocr
+Upstream-Contact: AMD HSA Support <dl.HSA-Runtime-Support@amd.com>
+Source: https://github.com/ROCm/hsa-rocr
+Files: *
+License: NSCA
+Copyright: 2025 Advanced Micro Devices, Inc. All rights Reserved.

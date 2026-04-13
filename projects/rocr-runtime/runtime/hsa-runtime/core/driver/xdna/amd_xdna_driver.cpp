@@ -1179,38 +1179,29 @@ void XdnaDriver::WaitThreadFunc() {
       continue;
     }
 
-    // Find and process completed command
+    // Process first signaled command
     {
       std::unique_lock<std::mutex> lock(pending_cmds_mutex_);
-
       CommandKey completed_key = key_map[first_signaled];
       auto it = active_cmds_.find(completed_key);
 
-      if (it == active_cmds_.end()) {
-        // Command already processed by another iteration, skip
-        continue;
-      }
+      if (it != active_cmds_.end()) {
+        HSA_QUEUEID queue_id = it->first.queue_id;
+        PendingCommand cmd = std::move(it->second);
+        active_cmds_.erase(it);
 
-      // Extract command data before erasing
-      HSA_QUEUEID queue_id = it->first.queue_id;
-      PendingCommand cmd = std::move(it->second);
-      active_cmds_.erase(it);
-
-      // Decrement pending count
-      auto count_it = pending_cmd_counts_.find(queue_id);
-      if (count_it != pending_cmd_counts_.end() && count_it->second > 0) {
-        count_it->second--;
-        if (count_it->second == 0) {
-          pending_cmd_counts_.erase(count_it);
-          queue_completion_cv_.notify_all();
+        auto count_it = pending_cmd_counts_.find(queue_id);
+        if (count_it != pending_cmd_counts_.end() && count_it->second > 0) {
+          count_it->second--;
+          if (count_it->second == 0) {
+            pending_cmd_counts_.erase(count_it);
+            queue_completion_cv_.notify_all();
+          }
         }
+
+        lock.unlock();
+        FlushAndSignal(cmd);
       }
-
-      // Release lock before expensive operations
-      lock.unlock();
-
-      // Process completion (flush, signal, cleanup) - outside lock
-      FlushAndSignal(cmd);
     }
 
     DestroyCompletedDeferredContexts();
@@ -1241,6 +1232,36 @@ void XdnaDriver::FlushAndSignal(PendingCommand& cmd) {
   if (cmd.cmd_chain_bo_handle.IsValid()) {
     DestroyBOHandle(cmd.cmd_chain_bo_handle);
   }
+}
+
+bool XdnaDriver::QuerySyncobjTimelineValues(
+    const std::vector<std::pair<uint32_t, uint64_t>>& wait_points,
+    std::vector<uint64_t>& current_values) {
+
+  if (wait_points.empty()) {
+    return false;
+  }
+
+  current_values.resize(wait_points.size());
+
+  // Query each syncobj's current timeline value
+  for (size_t i = 0; i < wait_points.size(); i++) {
+    struct drm_syncobj_timeline_array args = {};
+    uint64_t point = 0;
+
+    args.handles = reinterpret_cast<uint64_t>(&wait_points[i].first);
+    args.points = reinterpret_cast<uint64_t>(&point);
+    args.count_handles = 1;
+    args.flags = 0;
+
+    if (ioctl(fd_, DRM_IOCTL_SYNCOBJ_QUERY, &args) < 0) {
+      return false;
+    }
+
+    current_values[i] = point;
+  }
+
+  return true;
 }
 
 int XdnaDriver::SyncObjTimelineWaitAny(

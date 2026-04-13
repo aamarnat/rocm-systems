@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libhsakmt
+Description: HSA Kernel Mode Thunk library for AMD KFD support
+Version: 1.0.6
+
+Libs: -L${libdir} -lhsakmt
+Cflags: -I${includedir}
