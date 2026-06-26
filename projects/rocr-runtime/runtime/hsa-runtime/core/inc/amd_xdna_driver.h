@@ -44,15 +44,27 @@
 #define HSA_RUNTIME_CORE_INC_AMD_XDNA_DRIVER_H_
 
 #include <array>
+#include <atomic>
 #include <climits>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "core/inc/amd_aie_agent.h"
 #include "core/inc/driver.h"
 #include "core/inc/memory_region.h"
 
 namespace rocr {
+
+namespace core {
+class Signal;
+}
 
 namespace AMD {
 
@@ -80,6 +92,9 @@ class XdnaDriver final : public core::Driver {
 
 public:
   XdnaDriver(std::string devnode_name);
+
+  /// @brief Stops the async completion worker threads (if running) before teardown.
+  ~XdnaDriver() override;
 
   /// @brief Determine if the xdna-driver is present on the system and attempt to open it if found.
   ///
@@ -230,6 +245,104 @@ public:
 
   static constexpr size_t dev_heap_size = 64 * 1024 * 1024;
   static constexpr size_t dev_heap_align = 64 * 1024 * 1024;
+
+  // Asynchronous command completion (eliminates head-of-line blocking). Per dispatch
+  // (see SubmitCmdChain):
+  //   1. Submit (non-blocking) and poll the command state. If it has already completed or
+  //      errored, finish it inline and return (fast path).
+  //   2. If a per-context syncobj is available (the common case), register the command and let
+  //      a single background worker wait on all in-flight commands across every context with a
+  //      syncobj timeline wait-any, so whichever completes first is serviced first.
+  //   3. If the driver does not expose a syncobj (legacy), fall back to a synchronous
+  //      DRM_IOCTL_AMDXDNA_WAIT_CMD inline.
+
+  /// @brief A kernel argument buffer to flush from cache once the kernel completes.
+  struct OperandInfo {
+    void* addr = nullptr;
+    size_t size = 0;
+  };
+
+  /// @brief Identifies an in-flight command by its hardware context and sequence number.
+  struct CommandKey {
+    uint32_t hw_ctx_handle = 0;
+    uint64_t seq = 0;
+    bool operator==(const CommandKey& o) const {
+      return hw_ctx_handle == o.hw_ctx_handle && seq == o.seq;
+    }
+  };
+  struct CommandKeyHash {
+    std::size_t operator()(const CommandKey& k) const {
+      return std::hash<uint32_t>()(k.hw_ctx_handle) ^ (std::hash<uint64_t>()(k.seq) << 1);
+    }
+  };
+
+  /// @brief Bookkeeping for a command awaiting asynchronous completion.
+  struct PendingCommand {
+    uint32_t hw_ctx_handle = 0;
+    uint32_t syncobj_handle = 0;
+    uint64_t seq = 0;
+    /// Points at the ert command whose state field reflects success/failure once complete.
+    void* cmd_state = nullptr;
+    /// Completion signals to fire (decrement) when the command finishes.
+    std::vector<core::Signal*> completion_signals;
+    /// Output operands to flush from cache before firing the signals.
+    std::vector<OperandInfo> operands_to_flush;
+    /// Command BOs owned by this command; destroyed after completion.
+    std::vector<BOHandle> cmd_bo_handles;
+  };
+
+  /// @brief Result of polling a command's hardware state.
+  enum class CmdPoll { InProgress, Completed, Error };
+
+  /// @brief Polls the ert command state to implement the fast path.
+  static CmdPoll PollCommandState(void* cmd);
+
+  /// @brief Signals the completion worker to stop and joins it (idempotent).
+  void ShutdownAsyncThreads();
+
+  /// @brief Completion worker: syncobj timeline wait-any over all in-flight commands.
+  void WaitThreadFunc();
+
+  /// @brief Wraps DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT in wait-any mode.
+  ///
+  /// @param[in]  handles syncobj handles to wait on (one per in-flight command)
+  /// @param[in]  points  timeline points (command sequence numbers)
+  /// @param[out] first_signaled index of the first handle that signaled
+  /// @return 0 on success, negative on timeout/error
+  int SyncObjTimelineWaitAny(const std::vector<uint32_t>& handles,
+                             const std::vector<uint64_t>& points,
+                             uint32_t* first_signaled) const;
+
+  /// @brief Resolves a just-submitted command: finishes it inline if it already completed,
+  /// hands it to the completion worker if a per-context syncobj is available, or waits on it
+  /// inline on legacy hardware. Takes ownership of the command BOs in @p pending.
+  ///
+  /// @param[in] pending bookkeeping for the submitted command (command BOs, signals, operands)
+  /// @param[in] cmd_state pointer to the ert command whose state field reflects completion
+  /// @return HSA_STATUS_SUCCESS, or HSA_STATUS_ERROR if the command had already errored
+  hsa_status_t CompleteCommand(PendingCommand&& pending, void* cmd_state) const;
+
+  /// @brief Finalizes a finished command: on success flushes output operands; logs a diagnostic
+  /// on failure; then always fires the completion signals and frees the command BOs.
+  ///
+  /// @note The completion signals are released even on failure: the command is done either way,
+  /// and the signal is a "done" counter that the host blocks on, so skipping it would deadlock.
+  void FinalizeCommand(PendingCommand& cmd) const;
+
+  /// @brief Blocks until all in-flight commands on @p hw_ctx_handle have completed.
+  void WaitForQueueCompletion(uint32_t hw_ctx_handle) const;
+
+  /// Protects all async bookkeeping below. Mutable so const queue-lifecycle
+  /// methods (e.g. DestroyKernelModeQueue) can drain in-flight work.
+  mutable std::mutex async_mutex_;
+  /// In-flight commands serviced by the completion worker (keyed by context + sequence).
+  mutable std::unordered_map<CommandKey, PendingCommand, CommandKeyHash> active_cmds_;
+  /// Number of in-flight commands per hardware context (for draining).
+  mutable std::unordered_map<uint32_t, uint32_t> pending_cmd_counts_;
+  mutable std::condition_variable active_cmds_cv_;
+  mutable std::condition_variable queue_drained_cv_;
+  mutable std::thread wait_thread_;
+  mutable std::atomic<bool> shutdown_{false};
 };
 
 } // namespace AMD

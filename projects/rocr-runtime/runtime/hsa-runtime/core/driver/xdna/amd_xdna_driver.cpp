@@ -45,6 +45,7 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <ctime>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -429,70 +430,221 @@ static hsa_status_t SubmitCommand(int fd, uint32_t cmd_bo_handle,
   return HSA_STATUS_SUCCESS;
 }
 
-/**
- * @brief Waits for a command to finish.
- *
- * @param[in] fd driver file descriptor
- * @param[in] cmd command to wait for
- * @param[in] hw_ctx_handle hardware context handle
- * @param[in] syncobj_handle DRM syncobj handle for timeline wait
- * @param[in] seq sequence number of the command
- */
-static hsa_status_t WaitCommand(int fd, ert_start_kernel_cmd* cmd, uint32_t hw_ctx_handle,
-                                uint32_t syncobj_handle, uint64_t seq) {
-  assert(hw_ctx_handle != AMDXDNA_INVALID_CTX_HANDLE);
+XdnaDriver::XdnaDriver(std::string devnode_name)
+    : core::Driver(core::DriverType::XDNA, std::move(devnode_name)) {}
 
-  // Check command status before waiting to avoid unnecessary ioctl if the command has already
-  // completed.
-  auto& cmd_ref = *static_cast<volatile ert_start_kernel_cmd*>(cmd);
+XdnaDriver::~XdnaDriver() { ShutdownAsyncThreads(); }
+
+namespace {
+/// @brief Max time the syncobj timeline worker blocks in one wait-any before rebuilding its
+/// wait set. Bounds how quickly a newly-submitted command is added to the wait while
+/// older commands are still in flight. Small enough for low latency, large enough to
+/// avoid spinning. (A future optimization could wake the wait via a dedicated syncobj.)
+constexpr int64_t WAIT_ANY_TIMEOUT_NS = 10 * 1000 * 1000;  // 10 ms
+
+/**
+ * @brief Returns an absolute CLOCK_MONOTONIC deadline @p rel_ns nanoseconds from now, as
+ * expected by DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT::timeout_nsec.
+ *
+ * @param[in] rel_ns relative timeout in nanoseconds
+ * @return absolute monotonic deadline in nanoseconds
+ */
+int64_t MonotonicDeadlineNs(int64_t rel_ns) {
+  struct timespec ts = {};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec + rel_ns;
+}
+}  // namespace
+
+XdnaDriver::CmdPoll XdnaDriver::PollCommandState(void* cmd) {
+  const auto& cmd_ref = *static_cast<volatile ert_start_kernel_cmd*>(cmd);
   switch (cmd_ref.state) {
     case ERT_CMD_STATE_NEW:
     case ERT_CMD_STATE_QUEUED:
     case ERT_CMD_STATE_RUNNING:
-      // Command is still in progress, need to wait.
-      break;
+    case ERT_CMD_STATE_SUBMITTED:
+      return CmdPoll::InProgress;
     case ERT_CMD_STATE_COMPLETED:
-      // Command has completed, no need to wait.
-      return HSA_STATUS_SUCCESS;
+      return CmdPoll::Completed;
     default:
-      // Command is in an error state.
+      return CmdPoll::Error;
+  }
+}
+
+void XdnaDriver::ShutdownAsyncThreads() {
+  {
+    // Set the flag under the worker's mutex so a worker about to wait cannot miss the wakeup.
+    std::lock_guard<std::mutex> lock(async_mutex_);
+    if (shutdown_.load()) {
+      return;  // Already shut down.
+    }
+    shutdown_.store(true);
+  }
+  active_cmds_cv_.notify_all();
+  if (wait_thread_.joinable()) {
+    wait_thread_.join();
+  }
+}
+
+int XdnaDriver::SyncObjTimelineWaitAny(const std::vector<uint32_t>& handles,
+                                       const std::vector<uint64_t>& points,
+                                       uint32_t* first_signaled) const {
+  if (handles.empty()) {
+    return -1;
+  }
+
+  drm_syncobj_timeline_wait timeline_wait = {};
+  timeline_wait.handles = reinterpret_cast<uintptr_t>(handles.data());
+  timeline_wait.points = reinterpret_cast<uintptr_t>(points.data());
+  timeline_wait.count_handles = static_cast<uint32_t>(handles.size());
+  timeline_wait.timeout_nsec = MonotonicDeadlineNs(WAIT_ANY_TIMEOUT_NS);
+  // No WAIT_ALL flag => wait-any: return as soon as the first point signals.
+  timeline_wait.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+  timeline_wait.first_signaled = 0;
+
+  int ret = ioctl(fd_, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &timeline_wait);
+  if (ret == 0 && first_signaled != nullptr) {
+    *first_signaled = timeline_wait.first_signaled;
+  }
+  return ret;
+}
+
+void XdnaDriver::FinalizeCommand(PendingCommand& cmd) const {
+  const bool succeeded = PollCommandState(cmd.cmd_state) == CmdPoll::Completed;
+  if (!succeeded) {
+    debug_print("XDNA: AIE command failed (hw_ctx %u, seq %llu)\n", cmd.hw_ctx_handle,
+                static_cast<unsigned long long>(cmd.seq));
+  }
+
+  // Flush the kernel outputs from cache only on success; on failure they are invalid.
+  if (succeeded) {
+    for (const auto& operand : cmd.operands_to_flush) {
+      if (operand.addr != nullptr && operand.size > 0) {
+        FlushCpuCache(operand.addr, 0, operand.size);
+      }
+    }
+  }
+
+  // Always release the completion signals (the command is done either way; the host blocks on
+  // these as a counter and would deadlock otherwise), then free the command BOs.
+  for (auto* sig : cmd.completion_signals) {
+    if (sig != nullptr) {
+      sig->SubRelease(1);
+    }
+  }
+  for (auto& bo_handle : cmd.cmd_bo_handles) {
+    DestroyBOHandle(bo_handle);
+  }
+}
+
+hsa_status_t XdnaDriver::CompleteCommand(PendingCommand&& pending, void* cmd_state) const {
+  pending.cmd_state = cmd_state;
+
+  // Free the command BOs on any error return. Dismissed once ownership is handed off, either
+  // to FinalizeCommand (which frees them) or to the completion worker.
+  MAKE_NAMED_SCOPE_GUARD(bo_guard, [&] {
+    for (auto& bo_handle : pending.cmd_bo_handles) {
+      DestroyBOHandle(bo_handle);
+    }
+  });
+
+  // Fast path: the command may already be resolved by the time we poll.
+  switch (PollCommandState(cmd_state)) {
+    case CmdPoll::Completed:
+      bo_guard.Dismiss();
+      FinalizeCommand(pending);
+      return HSA_STATUS_SUCCESS;
+    case CmdPoll::Error:
+      // Surfaced synchronously to the caller (propagated as an exception by SubmitPackets).
       return HSA_STATUS_ERROR;
+    case CmdPoll::InProgress:
+      break;
   }
 
-  // Prefer DRM syncobj timeline wait when available.
-  if (syncobj_handle != 0) {
-    drm_syncobj_timeline_wait timeline_wait = {};
-    timeline_wait.handles = reinterpret_cast<uintptr_t>(&syncobj_handle);
-    timeline_wait.points = reinterpret_cast<uintptr_t>(&seq);
-    timeline_wait.count_handles = 1;
-    timeline_wait.timeout_nsec = INT64_MAX;
-    timeline_wait.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
-    hsa_status_t err = xdna_ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &timeline_wait);
-    if (err != HSA_STATUS_SUCCESS) {
-      return err;
+  if (pending.syncobj_handle != 0) {
+    // Common path: hand off to the completion worker, which waits on every in-flight command
+    // across all contexts and services whichever finishes first (no head-of-line blocking).
+    bo_guard.Dismiss();
+    const CommandKey key{pending.hw_ctx_handle, pending.seq};
+    {
+      std::lock_guard<std::mutex> lock(async_mutex_);
+      pending_cmd_counts_[pending.hw_ctx_handle]++;
+      active_cmds_.emplace(key, std::move(pending));
     }
-  } else {
-    // Fallback: XDNA-specific wait.
-    amdxdna_drm_wait_cmd wait_cmd = {};
-    wait_cmd.hwctx = hw_ctx_handle;
-    wait_cmd.timeout = 0;  // no timeout, wait until the command finishes
-    wait_cmd.seq = seq;
-    hsa_status_t err = xdna_ioctl(fd, DRM_IOCTL_AMDXDNA_WAIT_CMD, &wait_cmd);
-    if (err != HSA_STATUS_SUCCESS) {
-      return err;
-    }
+    active_cmds_cv_.notify_one();
+    return HSA_STATUS_SUCCESS;
   }
 
-  // Check if command failed.
-  if (cmd_ref.state != ERT_CMD_STATE_COMPLETED) {
-    return HSA_STATUS_ERROR;
+  // Legacy fallback: the driver exposes no per-context syncobj, so wait inline (XDNA-specific).
+  amdxdna_drm_wait_cmd wait_cmd = {};
+  wait_cmd.hwctx = pending.hw_ctx_handle;
+  wait_cmd.timeout = 0;  // no timeout, wait until the command finishes
+  wait_cmd.seq = pending.seq;
+  hsa_status_t err = xdna_ioctl(fd_, DRM_IOCTL_AMDXDNA_WAIT_CMD, &wait_cmd);
+  if (err != HSA_STATUS_SUCCESS) {
+    return err;
   }
+  bo_guard.Dismiss();
+  FinalizeCommand(pending);
   return HSA_STATUS_SUCCESS;
 }
 
+void XdnaDriver::WaitForQueueCompletion(uint32_t hw_ctx_handle) const {
+  std::unique_lock<std::mutex> lock(async_mutex_);
+  queue_drained_cv_.wait(lock, [this, hw_ctx_handle] {
+    return pending_cmd_counts_.find(hw_ctx_handle) == pending_cmd_counts_.end();
+  });
+}
 
-XdnaDriver::XdnaDriver(std::string devnode_name)
-    : core::Driver(core::DriverType::XDNA, std::move(devnode_name)) {}
+void XdnaDriver::WaitThreadFunc() {
+  while (true) {
+    std::vector<uint32_t> handles;
+    std::vector<uint64_t> points;
+    std::vector<CommandKey> keys;
+
+    {
+      std::unique_lock<std::mutex> lock(async_mutex_);
+      active_cmds_cv_.wait(lock, [this] { return shutdown_.load() || !active_cmds_.empty(); });
+      if (shutdown_.load()) {
+        return;
+      }
+      // Snapshot every in-flight syncobj command into the wait-any set.
+      handles.reserve(active_cmds_.size());
+      points.reserve(active_cmds_.size());
+      keys.reserve(active_cmds_.size());
+      for (const auto& [key, cmd] : active_cmds_) {
+        handles.push_back(cmd.syncobj_handle);
+        points.push_back(cmd.seq);
+        keys.push_back(key);
+      }
+    }
+
+    uint32_t first_signaled = 0;
+    int ret = SyncObjTimelineWaitAny(handles, points, &first_signaled);
+    // Timeout/error or a stale index (a queue was destroyed mid-wait): rebuild.
+    if (ret != 0 || first_signaled >= keys.size()) {
+      continue;
+    }
+
+    PendingCommand completed;
+    {
+      std::unique_lock<std::mutex> lock(async_mutex_);
+      auto it = active_cmds_.find(keys[first_signaled]);
+      if (it == active_cmds_.end()) {
+        continue;  // Already serviced (shouldn't happen with a single worker).
+      }
+      completed = std::move(it->second);
+      active_cmds_.erase(it);
+      // Drop the in-flight count; wake any queue waiting to be drained.
+      auto count_it = pending_cmd_counts_.find(completed.hw_ctx_handle);
+      if (count_it != pending_cmd_counts_.end() && --count_it->second == 0) {
+        pending_cmd_counts_.erase(count_it);
+        queue_drained_cv_.notify_all();
+      }
+    }
+    FinalizeCommand(completed);
+  }
+}
 
 hsa_status_t XdnaDriver::DiscoverDriver(std::unique_ptr<core::Driver>& driver) {
   for (uint32_t i = 0; i < devnode_max_minor_num; ++i) {
@@ -516,9 +668,21 @@ uint64_t XdnaDriver::GetDevHeapByteSize() {
   return dev_heap_size;
 }
 
-hsa_status_t XdnaDriver::Init() { return InitDeviceHeap(); }
+hsa_status_t XdnaDriver::Init() {
+  hsa_status_t status = InitDeviceHeap();
+  if (status != HSA_STATUS_SUCCESS) {
+    return status;
+  }
+  // Start the background completion worker (joined in ShutDown()/destructor).
+  wait_thread_ = std::thread(&XdnaDriver::WaitThreadFunc, this);
+  return HSA_STATUS_SUCCESS;
+}
 
-hsa_status_t XdnaDriver::ShutDown() { return FreeDeviceHeap(); }
+hsa_status_t XdnaDriver::ShutDown() {
+  // Stop the async workers before tearing down the device heap / closing the fd.
+  ShutdownAsyncThreads();
+  return FreeDeviceHeap();
+}
 
 hsa_status_t XdnaDriver::QueryKernelModeDriver(core::DriverQuery query) {
   switch (query) {
@@ -792,6 +956,10 @@ hsa_status_t XdnaDriver::DestroyKernelModeQueue(void* queue_metadata) const {
   // Create a unique_ptr to ensure cleanup.
   std::unique_ptr<KmqMetadata> kmq_metadata;
   kmq_metadata.reset(static_cast<KmqMetadata*>(queue_metadata));
+
+  // Wait for all asynchronously-dispatched commands on this context to complete before
+  // destroying it, so the workers never reference a destroyed context / syncobj.
+  WaitForQueueCompletion(kmq_metadata->hw_ctx_handle);
 
   // Destroy hardware context associated with the queue.
   hsa_status_t err = DestroyHwCtx(fd_, kmq_metadata->hw_ctx_handle);
@@ -1194,10 +1362,12 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_queue_t& q, void* queue_metadata,
 
   // Reconfigure hardware context.
   if (reconfigure_queue) {
+    // We are about to destroy and recreate the hardware context. Any commands previously
+    // submitted on this context are serviced asynchronously, so drain them first to avoid
+    // destroying the context (and its syncobj) out from under in-flight work.
+    WaitForQueueCompletion(kmq_metadata->hw_ctx_handle);
+
     // Destroy the existing hardware context.
-    // Note: we can do this because we have forced synchronization between command chains. If we
-    // move to a more asynchronous model, we will need to figure out how hardware context
-    // destruction works while applications are running.
     hsa_status_t err = DestroyHwCtx(fd_, kmq_metadata->hw_ctx_handle);
     if (err != HSA_STATUS_SUCCESS) {
       assert(false && "Failed to destroy hardware context for queue.");
@@ -1226,21 +1396,43 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_queue_t& q, void* queue_metadata,
     FlushArguments(pkt);
   }
 
+  // Capture the asynchronous-completion bookkeeping now: the completion signals and output
+  // operands must be read before we return, because the application may overwrite the queue
+  // packets once SubmitCmdChain returns. Output operands are flushed (and signals fired) by
+  // the worker after the command completes.
+  PendingCommand pending;
+  pending.hw_ctx_handle = kmq_metadata->hw_ctx_handle;
+  pending.syncobj_handle = kmq_metadata->syncobj_handle;
+  for (uint64_t i = 0; i < num_pkts; ++i) {
+    const auto pkt_idx = (first_pkt_idx + i) & mask;
+    auto* pkt = queue + pkt_idx;
+    if (pkt->completion_signal.handle != 0) {
+      core::Signal* sig = core::Signal::Convert(pkt->completion_signal);
+      if (sig != nullptr) {
+        pending.completion_signals.push_back(sig);
+      }
+    }
+    auto* kernarg_address = static_cast<uint64_t*>(pkt->kernarg_address);
+    for (uint32_t kernarg_idx = 0; kernarg_idx < pkt->num_kernargs; ++kernarg_idx) {
+      void* ptr = reinterpret_cast<void*>(kernarg_address[kernarg_idx]);
+      size_t size = kernarg_address[kernarg_idx + pkt->num_kernargs];
+      pending.operands_to_flush.push_back({ptr, size});
+    }
+  }
+
+  // Submit the command(s) without blocking. cmd_state_vaddr points at the ert command whose
+  // state field reflects completion (the chain wrapper BO for multi-packet dispatches).
+  uint64_t seq = 0;
+  void* cmd_state_vaddr = nullptr;
   if (num_pkts == 1) {
     // Single packet: submit the per-kernel cmd BO directly, no chain wrapper.
-    uint64_t seq = 0;
     hsa_status_t status =
         SubmitCommand(fd_, cmd_bo_handles[0].handle, bo_handles, kmq_metadata->hw_ctx_handle, seq);
     if (status != HSA_STATUS_SUCCESS) {
       assert(false && "Failed to submit command.");
       return status;
     }
-    status = WaitCommand(fd_, static_cast<ert_start_kernel_cmd*>(cmd_bo_handles[0].vaddr),
-                         kmq_metadata->hw_ctx_handle, kmq_metadata->syncobj_handle, seq);
-    if (status != HSA_STATUS_SUCCESS) {
-      assert(false && "Failed waiting for command.");
-      return status;
-    }
+    cmd_state_vaddr = cmd_bo_handles[0].vaddr;
   } else {
     // Create command chain for multi-packet dispatches.
     const size_t cmd_chain_data_bytesize = cmd_bo_handles.size() * sizeof(uint64_t);
@@ -1252,7 +1444,6 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_queue_t& q, void* queue_metadata,
       assert(false && "Failed to create command chain BO.");
       return status;
     }
-    MAKE_NAMED_SCOPE_GUARD(cmd_bo_handle_guard, [&] { DestroyBOHandle(cmd_bo_handle); });
 
     auto* cmd = static_cast<ert_start_kernel_cmd*>(cmd_bo_handle.vaddr);
     memset(cmd, 0, cmd_bytesize);
@@ -1265,40 +1456,26 @@ hsa_status_t XdnaDriver::SubmitCmdChain(hsa_queue_t& q, void* queue_metadata,
       cmd_chain->data[i] = cmd_bo_handles[i].handle;
     }
 
+    // The chain wrapper BO is owned alongside the per-kernel cmd BOs (freed on completion),
+    // and is covered by cmd_bo_handles_guard until ownership is transferred below.
+    cmd_bo_handles.push_back(cmd_bo_handle);
+
     // Execute all commands in the command chain.
-    uint64_t seq = 0;
     status = SubmitCommand(fd_, cmd_bo_handle.handle, bo_handles, kmq_metadata->hw_ctx_handle, seq);
     if (status != HSA_STATUS_SUCCESS) {
       assert(false && "Failed to submit command chain.");
       return status;
     }
-    status = WaitCommand(fd_, static_cast<ert_start_kernel_cmd*>(cmd_bo_handle.vaddr),
-                         kmq_metadata->hw_ctx_handle, kmq_metadata->syncobj_handle, seq);
-    if (status != HSA_STATUS_SUCCESS) {
-      assert(false && "Failed waiting for command chain.");
-      return status;
-    }
+    cmd_state_vaddr = cmd_bo_handle.vaddr;
   }
+  pending.seq = seq;
 
-  // Flush cache for the arguments again to ensure visibility of any changes made by the AIE kernels
-  // and fire completion signal for each packet.
-  for (uint64_t i = 0; i < num_pkts; ++i) {
-    const auto pkt_idx = (first_pkt_idx + i) & mask;
-    auto* pkt = queue + pkt_idx;
+  // Transfer ownership of the command BOs to the pending command; CompleteCommand frees them
+  // (inline or on the worker) once the command finishes.
+  pending.cmd_bo_handles = std::move(cmd_bo_handles);
+  cmd_bo_handles_guard.Dismiss();
 
-    // Flush cache.
-    FlushArguments(pkt);
-
-    // Fire completion signal.
-    if (pkt->completion_signal.handle != 0) {
-      core::Signal* sig = core::Signal::Convert(pkt->completion_signal);
-      sig->SubRelease(1);
-    }
-  }
-
-  // Guards will unmap and close cmd BOs and cmd_chain BO.
-
-  return HSA_STATUS_SUCCESS;
+  return CompleteCommand(std::move(pending), cmd_state_vaddr);
 }
 
 hsa_status_t XdnaDriver::SPMAcquire(uint32_t preferred_node_id) const {
