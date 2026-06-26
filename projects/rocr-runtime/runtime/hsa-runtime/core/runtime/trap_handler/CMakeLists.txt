@@ -46,6 +46,22 @@ cmake_minimum_required ( VERSION 3.7 )
 find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 find_package(LLVM REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 
+# NOTE (local build fix): ROCm's LLVM understands the newest gfx targets and the gfx12
+# trap-handler assembly, but ships no CMake package, so the find_package() calls above
+# resolve to the system LLVM (which rejects e.g. gfx950/gfx1250). Prefer the ROCm device
+# compiler / objcopy directly when present; fall back to the imported targets otherwise.
+find_program(ROCR_DEVICE_CLANG NAMES amdclang clang
+             HINTS ${ROCM_PATH}/bin /opt/rocm/bin /opt/rocm/llvm/bin)
+find_program(ROCR_DEVICE_OBJCOPY NAMES llvm-objcopy
+             HINTS ${ROCM_PATH}/lib/llvm/bin /opt/rocm/lib/llvm/bin /opt/rocm/bin)
+if(NOT ROCR_DEVICE_CLANG)
+  get_property(ROCR_DEVICE_CLANG TARGET clang PROPERTY LOCATION)
+endif()
+if(NOT ROCR_DEVICE_OBJCOPY)
+  get_property(ROCR_DEVICE_OBJCOPY TARGET llvm-objcopy PROPERTY LOCATION)
+endif()
+message(STATUS "Trap handler device clang: ${ROCR_DEVICE_CLANG}")
+
 set (TARGET_DEVS "gfx900;gfx942;gfx950;gfx1010;gfx1030;gfx1100;gfx1200;gfx1250")
 set (POSTFIX "9;942;950;1010;10;11;12;1250")
 set (SOURCE_SUFFIX ";;;;;;_gfx12;_gfx12")
@@ -69,8 +85,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
   "-x assembler -target amdgcn-amd-amdhsa -mcpu=${TARGET_ID} -o ${CODE_OBJECT} ${INPUT_FILE}")
 
   ## Add custom command to produce a code object file.
-  add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND clang ${CLANG_ARG_LIST}
-    DEPENDS ${INPUT_FILE} clang
+  add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND ${ROCR_DEVICE_CLANG} ${CLANG_ARG_LIST}
+    DEPENDS ${INPUT_FILE}
     COMMENT "BUILDING bitcode for ${OUTPUT_FILE}..."
     VERBATIM)
 
@@ -78,8 +94,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 
   ## Extract .text segment
   add_custom_command(OUTPUT ${OUTPUT_FILE}
-                     COMMAND llvm-objcopy ${OBJCOPY_ARG_LIST}
-                     DEPENDS ${CODE_OBJECT} llvm-objcopy
+                     COMMAND ${ROCR_DEVICE_OBJCOPY} ${OBJCOPY_ARG_LIST}
+                     DEPENDS ${CODE_OBJECT}
                      COMMENT "Extracting binary for ${OUTPUT_FILE}..."
                      VERBATIM)
 

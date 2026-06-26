@@ -48,6 +48,21 @@ cmake_minimum_required ( VERSION 3.7 )
 find_package(Clang REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 find_package(LLVM REQUIRED HINTS ${CMAKE_PREFIX_PATH}/llvm PATHS /opt/rocm/llvm )
 
+# NOTE (local build fix): ROCm's LLVM understands the newest gfx targets but ships no CMake
+# package, so find_package() resolves to the system LLVM (which rejects e.g. gfx950/gfx1250).
+# Prefer the ROCm device compiler / objcopy directly when present.
+find_program(ROCR_DEVICE_CLANG NAMES amdclang clang
+             HINTS ${ROCM_PATH}/bin /opt/rocm/bin /opt/rocm/llvm/bin)
+find_program(ROCR_DEVICE_OBJCOPY NAMES llvm-objcopy
+             HINTS ${ROCM_PATH}/lib/llvm/bin /opt/rocm/lib/llvm/bin /opt/rocm/bin)
+if(NOT ROCR_DEVICE_CLANG)
+  get_property(ROCR_DEVICE_CLANG TARGET clang PROPERTY LOCATION)
+endif()
+if(NOT ROCR_DEVICE_OBJCOPY)
+  get_property(ROCR_DEVICE_OBJCOPY TARGET llvm-objcopy PROPERTY LOCATION)
+endif()
+message(STATUS "Blit shaders device clang: ${ROCR_DEVICE_CLANG}")
+
 # Set the target devices
 set (TARGET_DEVS "gfx900;gfx1010;gfx1030;gfx1100;gfx1200;gfx1250")
 
@@ -71,8 +86,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 	separate_arguments(CLANG_ARG_LIST UNIX_COMMAND "-x assembler -target amdgcn-amd-amdhsa -mcode-object-version=5 -fPIC -mcpu=${TARGET_ID} -o ${CODE_OBJECT} ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE}")
 
 	# Add custom command to generate the kernel bitcode
-	add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND clang ${CLANG_ARG_LIST}
-	DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE} clang
+	add_custom_command(OUTPUT ${CODE_OBJECT} COMMAND ${ROCR_DEVICE_CLANG} ${CLANG_ARG_LIST}
+	DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE}
 	COMMENT "BUILDING bitcode for ${OUTPUT_FILE}..."
 	VERBATIM)
 
@@ -80,8 +95,8 @@ function(gen_kernel_bc TARGET_ID INPUT_FILE OUTPUT_FILE)
 
 	# Add custom command to extract binary from the bitcode
 	add_custom_command(OUTPUT ${OUTPUT_FILE}
-	COMMAND llvm-objcopy ${OBJCOPY_ARG_LIST}
-	DEPENDS ${CODE_OBJECT} llvm-objcopy
+	COMMAND ${ROCR_DEVICE_OBJCOPY} ${OBJCOPY_ARG_LIST}
+	DEPENDS ${CODE_OBJECT}
 	COMMENT "Extracting binary for ${OUTPUT_FILE}..."
 	VERBATIM)
 

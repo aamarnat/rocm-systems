@@ -50,6 +50,10 @@
 .set EC_QUEUE_WAVE_MEMORY_VIOLATION_M0             , (1 << (DOORBELL_ID_SIZE + 4))
 .set EC_QUEUE_WAVE_APERTURE_VIOLATION_M0           , (1 << (DOORBELL_ID_SIZE + 5))
 
+// Local build fix: the gfx12 WAVE_SCHED_MODE hwreg id is not a recognized symbolic name in
+// the device assembler, so define it explicitly (value per the gfx12 ISA hwreg encoding).
+.set HW_REG_WAVE_SCHED_MODE                        , 26
+
 .set SQ_WAVE_EXCP_FLAG_PRIV_ADDR_WATCH_MASK        , (1 << 4) - 1
 .set SQ_WAVE_EXCP_FLAG_PRIV_MEMVIOL_SHIFT          , 4
 .set SQ_WAVE_EXCP_FLAG_PRIV_SAVE_CONTEXT           , 5
